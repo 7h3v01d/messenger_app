@@ -3,31 +3,33 @@ Shared origin/host trust logic for navigation, popups, and browser
 permission grants. Two deliberately different policies:
 
 - Navigation policy: which hosts are allowed to load as the app's
-  main-frame content (messenger.com, facebook.com, and the CDN/media
-  hosts Messenger's own pages route through).
+  main-frame (top-level) content. Deliberately narrow — just
+  messenger.com and facebook.com. CDN/media hosts (fbcdn.net,
+  fbsbx.com) are NOT included here: acceptNavigationRequest() already
+  allows all non-main-frame traffic unconditionally, so Messenger's
+  own images/scripts/media never needed these domains in the
+  top-level allowlist in the first place. Keeping them out means a
+  CDN URL can never replace the entire contents of this
+  Messenger-branded native window.
 - Permission policy: which origins may be granted microphone/camera/
-  screen-share/notification access. Much narrower than navigation —
-  CDN/media hosts do NOT get privileged capability grants just
-  because Messenger happens to serve content from them, and the
-  check is origin-aware (scheme + host + port), not just hostname,
-  so http://messenger.com or https://messenger.com:4443 don't
-  silently inherit the same trust as https://messenger.com.
+  screen-share/notification access. Even narrower than navigation,
+  and origin-aware (scheme + host + port), not just hostname, so
+  http://messenger.com or https://messenger.com:4443 don't silently
+  inherit the same trust as https://messenger.com.
 
 Kept Qt-free so it's testable without spinning up WebEngine.
 """
 
+# Deliberately narrow: only real top-level Messenger/Facebook pages.
+# CDN/media hosts are excluded — see module docstring.
 NAVIGATION_HOST_SUFFIXES = (
     "messenger.com",
     "facebook.com",
-    "fbcdn.net",
-    "fbsbx.com",
 )
 
-# Narrower than navigation: only real Messenger/Facebook origins get
-# to ask for a microphone, camera, screen share, or to raise native
-# notifications. CDN/media-serving hosts are excluded on purpose —
-# they shouldn't inherit that authority just because they're allowed
-# to appear as navigation targets.
+# Narrower still: only real Messenger/Facebook origins get to ask for
+# a microphone, camera, screen share, or to raise native
+# notifications.
 PERMISSION_HOST_SUFFIXES = (
     "messenger.com",
     "facebook.com",
@@ -49,10 +51,10 @@ def _host_matches(host: str, suffixes) -> bool:
 def is_trusted_navigation_target(scheme: str, host: str) -> bool:
     """True if a top-level navigation to this scheme+host should stay
     inside the app. Internal schemes (about:blank etc.) are allowed;
-    everything else must be HTTPS to a Messenger/Facebook-family host.
-    Plain http, or a non-network scheme like data:, is rejected even
-    if the host looks right — a spoofed/crafted URL with a convincing
-    host is exactly the case this needs to catch."""
+    everything else must be HTTPS to messenger.com/facebook.com (or a
+    subdomain). Plain http, or a non-network scheme like data:, is
+    rejected even if the host looks right — a spoofed/crafted URL
+    with a convincing host is exactly the case this needs to catch."""
     scheme = (scheme or "").lower()
     host = (host or "").lower()
     if host == "":
@@ -66,9 +68,7 @@ def is_trusted_permission_origin(scheme: str, host: str, port) -> bool:
     """True only for a real HTTPS Messenger/Facebook origin on the
     default port. Used to gate microphone/camera/screen-share/
     notification grants — deliberately fails closed on anything
-    ambiguous: empty host, non-HTTPS, a non-default port, or a
-    CDN/media host that's fine for navigation but shouldn't carry
-    this level of privilege."""
+    ambiguous: empty host, non-HTTPS, or a non-default port."""
     scheme = (scheme or "").lower()
     host = (host or "").lower()
     if not host or scheme != "https":

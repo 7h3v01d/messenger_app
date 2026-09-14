@@ -23,7 +23,7 @@ import re
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QUrl, Qt
+from PyQt6.QtCore import QUrl, Qt, QTimer, QPersistentModelIndex, QModelIndex
 from PyQt6.QtGui import QIcon, QAction, QDesktopServices, QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon,
     QMenu,
     QInputDialog,
+    QMessageBox,
 )
 from PyQt6.QtWebEngineCore import (
     QWebEngineProfile,
@@ -59,11 +60,8 @@ MESSENGER_URL = "https://messenger.com"
 # regardless of which module happens to be executing.
 ENTRY_SCRIPT = Path(__file__).resolve()
 
-# Permission types we're willing to auto-grant, and only ever to a
-# trusted (Messenger/Facebook) origin — needed for calls, screen
-# share, and native-looking notifications. Desktop capture also
-# requires completing the desktopMediaRequested picker flow below;
-# granting the permission alone doesn't let a source be selected.
+# Permission types we're willing to consider granting, and only ever
+# to a trusted (Messenger/Facebook) origin.
 GRANTABLE_PERMISSIONS = {
     QWebEnginePermission.PermissionType.MediaAudioCapture,
     QWebEnginePermission.PermissionType.MediaVideoCapture,
@@ -73,10 +71,21 @@ GRANTABLE_PERMISSIONS = {
     QWebEnginePermission.PermissionType.Notifications,
 }
 
+# Mic/camera get an extra native confirmation prompt beyond the origin
+# check, since granting the OS-level permission silently would let any
+# trusted-origin page turn them on with no human decision point at
+# all. Screen share already has an equivalent gate (the source
+# picker); notifications are low-stakes enough not to need one.
+MEDIA_CAPTURE_PERMISSIONS = {
+    QWebEnginePermission.PermissionType.MediaAudioCapture,
+    QWebEnginePermission.PermissionType.MediaVideoCapture,
+    QWebEnginePermission.PermissionType.MediaAudioVideoCapture,
+}
+
 
 class MessengerPage(QWebEnginePage):
     """Enforces a trust boundary on top-level navigation: Messenger and
-    Facebook-family origins stay inside the app; anything else (a
+    Facebook top-level origins stay inside the app; anything else (a
     clicked link, a redirect, a compromised/injected page) is sent to
     the system browser instead of loading inside this Messenger-branded
     native window — and only if it's a scheme worth handing to the OS
@@ -208,7 +217,8 @@ class MessengerWindow(QMainWindow):
         self.app_icon = build_app_icon()
         self.setWindowIcon(self.app_icon)
         self.taskbar_badge = None  # created after the native window exists
-        self._current_notification = None  # kept alive so .click() works
+        self._current_notification = None  # kept alive so .click()/.close() work
+        self._session_media_permission_choice = None  # cached Yes/No for this run
 
         # Persistent profile so login/session survives restarts.
         profile = QWebEngineProfile("messenger-standalone", self)
@@ -255,27 +265,64 @@ class MessengerWindow(QMainWindow):
     def _handle_permission_requested(self, permission):
         origin = permission.origin()
         trusted = is_trusted_permission_origin(origin.scheme(), origin.host(), origin.port())
-        if trusted and permission.permissionType() in GRANTABLE_PERMISSIONS:
-            permission.grant()
-        else:
+        permission_type = permission.permissionType()
+
+        if not trusted or permission_type not in GRANTABLE_PERMISSIONS:
             permission.deny()
+            return
+
+        if permission_type in MEDIA_CAPTURE_PERMISSIONS and not self._confirm_media_permission():
+            permission.deny()
+            return
+
+        permission.grant()
+
+    def _confirm_media_permission(self) -> bool:
+        """A native Allow/Deny prompt for microphone/camera, on top of
+        the origin check — the origin check alone would let any
+        trusted-origin page turn the mic/camera on with no human
+        decision point at all. Cached for the rest of this run so it
+        doesn't re-prompt on every call."""
+        if self._session_media_permission_choice is not None:
+            return self._session_media_permission_choice
+
+        reply = QMessageBox.question(
+            self,
+            "Messenger",
+            "Messenger wants to use your microphone and camera.\n\nAllow?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        self._session_media_permission_choice = reply == QMessageBox.StandardButton.Yes
+        return self._session_media_permission_choice
 
     def _handle_desktop_media_requested(self, request):
         # Reached only after DesktopVideoCapture/DesktopAudioVideoCapture
         # was already granted to a trusted origin above; this step just
-        # lets the user pick *which* screen/window to share — without
-        # it, Messenger's getDisplayMedia() call would hang forever
-        # with no source ever selected.
+        # lets the user pick *which* screen/window to share.
+        #
+        # The screen/window list is a live Qt model that can change
+        # while the picker dialog is open (a window closes, a new one
+        # appears). Snapshotting a plain row number and recreating
+        # model.index(row, 0) later can silently end up pointing at a
+        # different source than the one the user actually picked — for
+        # a screen-share capability that's a privacy bug, not just a
+        # UI glitch. QPersistentModelIndex tracks the same underlying
+        # item across model changes instead of a row position, and is
+        # revalidated immediately before use.
         screens_model = request.screensModel()
         windows_model = request.windowsModel()
 
-        options = []
+        options = []  # (label, QPersistentModelIndex, kind)
         for row in range(screens_model.rowCount()):
-            label = screens_model.index(row, 0).data(Qt.ItemDataRole.DisplayRole)
-            options.append((f"Screen: {label}", "screen", row))
+            index = screens_model.index(row, 0)
+            label = index.data(Qt.ItemDataRole.DisplayRole)
+            # Row number folded into the label so two sources with an
+            # identical title are still distinguishable in the list.
+            options.append((f"Screen {row + 1}: {label}", QPersistentModelIndex(index), "screen"))
         for row in range(windows_model.rowCount()):
-            label = windows_model.index(row, 0).data(Qt.ItemDataRole.DisplayRole)
-            options.append((f"Window: {label}", "window", row))
+            index = windows_model.index(row, 0)
+            label = index.data(Qt.ItemDataRole.DisplayRole)
+            options.append((f"Window {row + 1}: {label}", QPersistentModelIndex(index), "window"))
 
         if not options:
             request.cancel()
@@ -289,11 +336,18 @@ class MessengerWindow(QMainWindow):
             request.cancel()
             return
 
-        _, kind, row = options[labels.index(choice)]
+        _, persistent_index, kind = options[labels.index(choice)]
+        if not persistent_index.isValid():
+            # The source disappeared (e.g. window closed) while the
+            # picker was open — don't guess, just cancel the request.
+            request.cancel()
+            return
+
+        index = QModelIndex(persistent_index)
         if kind == "screen":
-            request.selectScreen(screens_model.index(row, 0))
+            request.selectScreen(index)
         else:
-            request.selectWindow(windows_model.index(row, 0))
+            request.selectWindow(index)
 
     def _handle_new_window_request(self, request):
         # Messenger uses target="_blank" for some links (e.g. external
@@ -313,18 +367,55 @@ class MessengerWindow(QMainWindow):
         if not is_trusted_permission_origin(origin.scheme(), origin.host(), origin.port()):
             return  # ignore notifications from any non-Messenger origin
 
+        # Only one active notification at a time: close the previous
+        # one before showing the next, rather than just overwriting
+        # the reference and leaking/never-closing it.
+        self._close_current_notification()
+
         self._current_notification = notification
+        notification.closed.connect(lambda n=notification: self._on_notification_closed(n))
         notification.show()
+
         self.tray.showMessage(
             notification.title() or "Messenger",
             notification.message(),
             QSystemTrayIcon.MessageIcon.Information,
             5000,
         )
+        # Keep our reference's lifetime roughly matching the balloon's
+        # own ~5s display time. Bound to this specific notification
+        # object (not "whatever is current" at fire time) so a newer
+        # notification arriving in the meantime can't get closed early
+        # by an older notification's expiry timer.
+        QTimer.singleShot(5000, lambda n=notification: self._expire_notification(n))
+
+    def _on_notification_closed(self, notification):
+        if self._current_notification is notification:
+            self._current_notification = None
+
+    def _expire_notification(self, notification):
+        if self._current_notification is notification:
+            self._close_current_notification()
+
+    def _close_current_notification(self):
+        if self._current_notification is not None:
+            notification = self._current_notification
+            self._current_notification = None
+            try:
+                notification.close()
+            except Exception:
+                pass
 
     def _on_tray_message_clicked(self):
+        # Note: Qt can also emit this when the tray icon itself is
+        # clicked while a balloon happens to be showing, not only on a
+        # genuine balloon click — there's no way to fully disambiguate
+        # that from here. Closing immediately after click at least
+        # keeps the window for a mis-click narrow.
         if self._current_notification is not None:
-            self._current_notification.click()
+            notification = self._current_notification
+            notification.click()
+            self._close_current_notification()
 
     def _setup_global_hotkey(self):
         # Ctrl+Alt+M to show/hide from anywhere. Change the modifiers/
@@ -417,6 +508,7 @@ class MessengerWindow(QMainWindow):
         )
 
     def cleanup(self):
+        self._close_current_notification()
         if self.taskbar_badge is not None:
             self.taskbar_badge.cleanup()
 

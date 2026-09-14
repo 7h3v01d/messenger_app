@@ -20,8 +20,11 @@ spoofing.
   link/image actions) instead of Chromium's full default menu
 - "Launch at Startup" toggle in the tray menu
 - Global hotkey (default **Ctrl+Alt+M**) to show/hide from anywhere
-- Screen sharing works end-to-end: a simple picker lets you choose
-  which screen or window to share when Messenger requests it
+- Screen sharing works end-to-end and picks the source you actually
+  chose, even if the live screen/window list changes while the picker
+  is open
+- Microphone/camera requests get a native confirmation prompt, not
+  just a silent origin check
 - Navigation, popups, and browser permissions (mic/camera/screen
   share/notifications) are all restricted by origin — see Security
   notes below
@@ -81,33 +84,56 @@ site, so the trust boundary matters — and it's deliberately **two
 different policies**, not one:
 
 - **Navigation policy** (`is_trusted_navigation_target`): which hosts
-  are allowed to load as top-level content — `messenger.com`,
-  `facebook.com`, `fbcdn.net`, `fbsbx.com`, and their subdomains,
-  over HTTPS only. `MessengerPage.acceptNavigationRequest()` enforces
-  this; anything else opens externally (if it's a scheme worth
-  handing to the OS at all — see below) instead of loading inside
-  this Messenger-branded window. `target="_blank"` popups follow the
-  same rule.
+  are allowed to load as top-level content — just `messenger.com` and
+  `facebook.com` (and their subdomains), over HTTPS only.
+  `fbcdn.net`/`fbsbx.com` are deliberately *not* included: they're
+  only ever needed as subresources (images, media), which
+  `acceptNavigationRequest()` already allows unconditionally via its
+  `is_main_frame` check, so they never needed a place in the
+  top-level allowlist. `MessengerPage.acceptNavigationRequest()`
+  enforces this; anything else opens externally (if it's a scheme
+  worth handing to the OS at all — see below) instead of loading
+  inside this Messenger-branded window. `target="_blank"` popups
+  follow the same rule.
 - **Permission policy** (`is_trusted_permission_origin`) — narrower
-  and origin-aware, not just hostname-based: only a real HTTPS
+  still and origin-aware, not just hostname-based: only a real HTTPS
   `messenger.com`/`facebook.com` origin on the default port can be
   granted microphone, camera, screen-share, or notification access.
-  `fbcdn.net`/`fbsbx.com` are fine as navigation/CDN targets but are
-  **not** in this list — they don't need and shouldn't get that level
-  of privilege just because Messenger happens to serve content from
-  them. `http://messenger.com` or `https://messenger.com:4443` are
-  rejected too — matching the scheme and port, not just the host
-  name, is what makes this origin-safe rather than hostname-only.
+  `http://messenger.com` or `https://messenger.com:4443` are rejected
+  too — matching the scheme and port, not just the host name, is what
+  makes this origin-safe rather than hostname-only.
+- **Microphone/camera get an extra native confirmation prompt**
+  beyond the origin check (`_confirm_media_permission`) — the origin
+  check alone would let any trusted-origin page turn the mic/camera
+  on with zero human decision point. The choice is cached for the
+  rest of the running session so it doesn't re-prompt on every call.
+  Screen share has an equivalent gate built in already (you have to
+  actively pick a source); notifications don't get one since they're
+  lower-stakes.
+- **Screen sharing** (`_handle_desktop_media_requested`): the
+  screen/window list Qt provides is a live model that can change
+  while the picker dialog is open. The picker uses
+  `QPersistentModelIndex` per option (not a raw row number) so the
+  source you actually clicked stays correctly identified even if
+  another window opens or closes in the meantime, and it's
+  revalidated immediately before `selectScreen()`/`selectWindow()` —
+  if the chosen source disappeared while the dialog was open, the
+  request is cancelled rather than guessing. Each option's label also
+  includes its position (`Window 2: Chrome`) so two sources sharing
+  an identical title stay individually selectable.
+- **Notification lifecycle**: only one notification is kept active at
+  a time — a new one closes the previous rather than silently
+  replacing the reference and leaking it. Expiry (matching the ~5s
+  tray balloon lifetime) and the `closed` signal are both tied to the
+  specific notification object they belong to, so a late timer from
+  an older notification can't close a newer one that replaced it in
+  the meantime.
 - **External scheme delegation**: any URL that fails the trust check
   only gets handed to the OS's default handler
   (`QDesktopServices.openUrl`) if it's `http`, `https`, or `mailto`
   (`is_externally_openable`). A hostile link using some other scheme
   is dropped rather than silently launched through whatever handler
   Windows has registered for it.
-- **Screen sharing**: `desktopMediaRequested` is handled with a
-  simple picker (`_handle_desktop_media_requested`) so a capture
-  source actually gets selected — granting the permission alone
-  isn't enough for Chromium to start capturing.
 
 If you ever need to widen or narrow either policy, it's all in
 `trusted_origins.py` — update it there and every consumer (nav,
@@ -171,35 +197,44 @@ someone else.
 
 ## Changelog
 
-**v0.4** — Fixes from a second adversarial review:
-- Split the single hostname-based trust check into two origin-aware
-  policies: a broader navigation policy and a much narrower
-  permission policy, so `fbcdn.net`/`fbsbx.com` (and any impostor
-  subdomain of them) can no longer be granted microphone/camera/
-  screen-share/notification access just by being valid navigation
-  targets
-- Permission trust now checks scheme and port, not just hostname —
-  `http://messenger.com` and `https://messenger.com:4443` no longer
-  silently inherit the same trust as `https://messenger.com`
-- Navigation's previous "empty host is trusted" shortcut no longer
-  also trusts `data:` — only genuinely internal schemes (`about:`,
-  `qrc:`) get that pass; the permission policy never trusts an empty
-  host under any scheme
-- External link/popup delegation to the OS is now restricted to
-  `http`/`https`/`mailto` — other schemes are dropped instead of
-  being handed to whatever handler Windows has registered for them
-- Implemented `desktopMediaRequested` with a source picker, so screen
-  sharing actually completes instead of granting a permission that
-  goes nowhere
-- Completed the native notification lifecycle: notifications are now
-  retained and `.show()`n, and clicking the OS notification calls
-  `.click()` on the underlying `QWebEngineNotification` so Messenger's
-  own click handling runs
-- Added a packaging note for macOS zip artifacts (`__MACOSX`, `._*`
-  resource-fork files) that were showing up in release archives
-- Confirmed `tests/test_pure_logic.py` lives under `tests/` (as the
-  README always specified) and expanded it to cover both trust
-  policies and the external-scheme check — 20 tests total
+**v0.5** — Fixes from a third adversarial review:
+- Fixed a release-blocking screen-share bug: the picker previously
+  snapshotted each source as a plain row number and recreated the
+  model index later, which could silently select the wrong
+  screen/window if the live source list changed while the dialog was
+  open. Now uses `QPersistentModelIndex` per option, revalidated
+  immediately before `selectScreen()`/`selectWindow()`, with the
+  request cancelled if the chosen source disappeared in the meantime
+- Row-numbered picker labels so two sources with identical titles
+  (e.g. two windows both named "Chrome") are still distinguishable
+- Added a native Allow/Deny confirmation for microphone/camera
+  requests on top of the origin check, so a trusted-origin page can't
+  silently turn them on with zero human decision point; cached for
+  the running session
+- Removed `fbcdn.net`/`fbsbx.com` from the top-level navigation
+  allowlist too (previously only removed from permissions) — they
+  were never needed there since subresources already bypass the
+  check entirely, and keeping them let a CDN URL replace the whole
+  window as a top-level page
+- Fixed the notification lifecycle: only one notification stays
+  active at a time (a new one closes the previous instead of leaking
+  the reference), and both the `closed` signal and the ~5s expiry
+  timer are bound to the specific notification object they belong to,
+  so a late timer from an old notification can't close a newer one
+- Added tests for the picker's label-uniqueness rule and the narrowed
+  navigation allowlist — 23 tests total, all passing
+- This release is packaged as a zip built directly from the working
+  tree (`tests/` included as an actual subdirectory, no `__MACOSX`/
+  `._*` artifacts) rather than assembled from individually downloaded
+  files, since that reassembly step was the likely source of the
+  packaging mismatches flagged in the last two reviews
+
+**v0.4** — Fixes from a second adversarial review: split the trust
+check into separate navigation vs. permission policies, made the
+permission policy origin-aware (scheme + port, not just hostname),
+restricted external scheme delegation to http/https/mailto,
+implemented `desktopMediaRequested` (first pass), completed the
+notification click-through lifecycle (first pass).
 
 **v0.3** — Fixes from the first adversarial review: startup command
 bug, tray menu ownership, `target="_blank"` handling, taskbar HICON
