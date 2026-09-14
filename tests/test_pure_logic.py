@@ -27,12 +27,19 @@ UNREAD_TITLE_RE = re.compile(r"^\((\d+)\)")
 
 class TestNavigationTrust(unittest.TestCase):
     def test_https_exact_matches_are_trusted(self):
-        for host in ("messenger.com", "facebook.com", "fbcdn.net", "fbsbx.com"):
+        for host in ("messenger.com", "facebook.com"):
             self.assertTrue(is_trusted_navigation_target("https", host))
 
     def test_https_subdomains_are_trusted(self):
         self.assertTrue(is_trusted_navigation_target("https", "www.messenger.com"))
-        self.assertTrue(is_trusted_navigation_target("https", "static.xx.fbcdn.net"))
+        self.assertTrue(is_trusted_navigation_target("https", "m.facebook.com"))
+
+    def test_cdn_hosts_are_not_trusted_as_top_level_navigation(self):
+        # fbcdn.net/fbsbx.com are fine as subresources (images, media)
+        # via acceptNavigationRequest's is_main_frame check, but must
+        # NOT be able to replace the whole window as a top-level page.
+        self.assertFalse(is_trusted_navigation_target("https", "scontent.fbcdn.net"))
+        self.assertFalse(is_trusted_navigation_target("https", "media.fbsbx.com"))
 
     def test_plain_http_is_not_trusted(self):
         # Same host, wrong scheme — must not inherit trust.
@@ -94,6 +101,29 @@ class TestExternallyOpenable(unittest.TestCase):
     def test_arbitrary_custom_schemes_are_not_openable(self):
         for scheme in ("file", "data", "javascript", "ms-word", "steam"):
             self.assertFalse(is_externally_openable(scheme))
+
+
+class TestDesktopMediaLabelDisambiguation(unittest.TestCase):
+    """The screen-share picker folds a 1-based row number into each
+    option's label (e.g. "Window 1: Chrome", "Window 2: Chrome") so
+    that two sources sharing an identical title are still individually
+    selectable — labels.index(choice) would otherwise always resolve
+    to the first match. This tests just that string-building rule in
+    isolation, without needing a live Qt model."""
+
+    @staticmethod
+    def build_labels(screen_titles, window_titles):
+        labels = [f"Screen {i + 1}: {t}" for i, t in enumerate(screen_titles)]
+        labels += [f"Window {i + 1}: {t}" for i, t in enumerate(window_titles)]
+        return labels
+
+    def test_duplicate_window_titles_produce_unique_labels(self):
+        labels = self.build_labels([], ["My Browser", "My Browser"])
+        self.assertEqual(len(labels), len(set(labels)))
+
+    def test_duplicate_screen_and_window_titles_produce_unique_labels(self):
+        labels = self.build_labels(["Display", "Display"], ["Display"])
+        self.assertEqual(len(labels), len(set(labels)))
 
 
 class TestUnreadTitleParsing(unittest.TestCase):
