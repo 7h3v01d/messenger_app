@@ -1,0 +1,17 @@
+# For an app whose whole job is rendering an authenticated site, the
+# WebEngine/Chromium version IS your security perimeter — don't let
+# this drift to an old, unpatched Chromium via a loose lower bound.
+# QWebEnginePermission (used for mic/camera/notification permission
+# gating) requires Qt 6.8+.
+#
+# Update deliberately: `pip install --upgrade -r requirements.txt`
+# periodically rather than letting >= silently pull in whatever's
+# newest at install time on someone else's machine.
+PyQt6>=6.8
+PyQt6-WebEngine>=6.8
+
+# Windows-only: taskbar overlay badge, launch-on-startup, and global
+# hotkey. Installing on macOS/Linux (e.g. for development) will skip
+# these automatically; the corresponding modules already no-op there.
+comtypes>=1.2; sys_platform == "win32"
+pywin32>=306; sys_platform == "win32"
