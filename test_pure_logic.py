@@ -1,8 +1,8 @@
 """
 Unit tests for the pure-logic pieces of the app — the ones the review
 specifically called out as easy to cover and exactly where real bugs
-were found (startup command generation, trusted-origin classification,
-unread-title parsing). No Qt/WebEngine needed to run these.
+were found (startup command, trust policies, unread-title parsing).
+No Qt/WebEngine needed to run these.
 
 Run with:
     python -m unittest discover -s tests
@@ -15,38 +15,85 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from trusted_origins import is_trusted_host
+from trusted_origins import (
+    is_trusted_navigation_target,
+    is_trusted_permission_origin,
+    is_externally_openable,
+)
 
 # Mirrors messenger_app.UNREAD_TITLE_RE without importing the Qt-heavy module.
 UNREAD_TITLE_RE = re.compile(r"^\((\d+)\)")
 
 
-class TestTrustedOrigins(unittest.TestCase):
-    def test_exact_matches_are_trusted(self):
+class TestNavigationTrust(unittest.TestCase):
+    def test_https_exact_matches_are_trusted(self):
         for host in ("messenger.com", "facebook.com", "fbcdn.net", "fbsbx.com"):
-            self.assertTrue(is_trusted_host(host))
+            self.assertTrue(is_trusted_navigation_target("https", host))
 
-    def test_subdomains_are_trusted(self):
-        self.assertTrue(is_trusted_host("www.messenger.com"))
-        self.assertTrue(is_trusted_host("static.xx.fbcdn.net"))
-        self.assertTrue(is_trusted_host("m.facebook.com"))
+    def test_https_subdomains_are_trusted(self):
+        self.assertTrue(is_trusted_navigation_target("https", "www.messenger.com"))
+        self.assertTrue(is_trusted_navigation_target("https", "static.xx.fbcdn.net"))
 
-    def test_empty_host_is_trusted(self):
-        # about:blank, data:, qrc: — internal, not attacker-controlled.
-        self.assertTrue(is_trusted_host(""))
+    def test_plain_http_is_not_trusted(self):
+        # Same host, wrong scheme — must not inherit trust.
+        self.assertFalse(is_trusted_navigation_target("http", "messenger.com"))
+
+    def test_internal_schemes_with_empty_host_are_trusted(self):
+        self.assertTrue(is_trusted_navigation_target("about", ""))
+        self.assertTrue(is_trusted_navigation_target("qrc", ""))
+
+    def test_data_scheme_with_empty_host_is_not_trusted(self):
+        # data: content is not inherently trusted just because it has
+        # no host to check.
+        self.assertFalse(is_trusted_navigation_target("data", ""))
 
     def test_unrelated_domains_are_not_trusted(self):
-        self.assertFalse(is_trusted_host("evil.com"))
-        self.assertFalse(is_trusted_host("google.com"))
+        self.assertFalse(is_trusted_navigation_target("https", "evil.com"))
 
     def test_lookalike_domains_are_not_trusted(self):
-        # Must not match by substring — only real subdomains count.
-        self.assertFalse(is_trusted_host("notfacebook.com"))
-        self.assertFalse(is_trusted_host("facebook.com.evil.net"))
-        self.assertFalse(is_trusted_host("messenger.com.attacker.io"))
+        self.assertFalse(is_trusted_navigation_target("https", "notfacebook.com"))
+        self.assertFalse(is_trusted_navigation_target("https", "facebook.com.evil.net"))
 
     def test_case_insensitive(self):
-        self.assertTrue(is_trusted_host("Messenger.COM"))
+        self.assertTrue(is_trusted_navigation_target("https", "Messenger.COM"))
+
+
+class TestPermissionTrust(unittest.TestCase):
+    def test_https_default_port_messenger_or_facebook_is_trusted(self):
+        self.assertTrue(is_trusted_permission_origin("https", "messenger.com", -1))
+        self.assertTrue(is_trusted_permission_origin("https", "www.facebook.com", -1))
+
+    def test_explicit_default_port_443_is_trusted(self):
+        self.assertTrue(is_trusted_permission_origin("https", "messenger.com", 443))
+
+    def test_non_default_port_is_not_trusted(self):
+        self.assertFalse(is_trusted_permission_origin("https", "messenger.com", 4443))
+
+    def test_http_is_not_trusted(self):
+        self.assertFalse(is_trusted_permission_origin("http", "messenger.com", -1))
+
+    def test_empty_host_is_never_trusted_for_permissions(self):
+        # Unlike navigation, there is no internal-scheme exception here —
+        # permission grants must fail closed on an empty/ambiguous origin.
+        self.assertFalse(is_trusted_permission_origin("about", "", -1))
+        self.assertFalse(is_trusted_permission_origin("data", "", -1))
+
+    def test_cdn_hosts_are_not_trusted_for_permissions(self):
+        # fbcdn.net/fbsbx.com are fine as navigation targets but must
+        # NOT be able to request microphone/camera/screen-share/
+        # notification access just by being a valid content host.
+        self.assertFalse(is_trusted_permission_origin("https", "scontent.fbcdn.net", -1))
+        self.assertFalse(is_trusted_permission_origin("https", "media.fbsbx.com", -1))
+
+
+class TestExternallyOpenable(unittest.TestCase):
+    def test_http_https_mailto_are_openable(self):
+        for scheme in ("http", "https", "mailto"):
+            self.assertTrue(is_externally_openable(scheme))
+
+    def test_arbitrary_custom_schemes_are_not_openable(self):
+        for scheme in ("file", "data", "javascript", "ms-word", "steam"):
+            self.assertFalse(is_externally_openable(scheme))
 
 
 class TestUnreadTitleParsing(unittest.TestCase):

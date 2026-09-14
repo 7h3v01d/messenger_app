@@ -13,7 +13,7 @@ Files:
     windows_taskbar.py   - Windows taskbar overlay badge (ITaskbarList3)
     startup_manager.py   - Windows launch-at-startup toggle
     global_hotkey.py     - system-wide show/hide hotkey
-    trusted_origins.py   - shared allowlist for navigation/popups/permissions
+    trusted_origins.py   - shared navigation/permission trust policies
 
 Run:
     python messenger_app.py
@@ -25,7 +25,13 @@ from pathlib import Path
 
 from PyQt6.QtCore import QUrl, Qt
 from PyQt6.QtGui import QIcon, QAction, QDesktopServices, QGuiApplication
-from PyQt6.QtWidgets import QApplication, QMainWindow, QSystemTrayIcon, QMenu
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QSystemTrayIcon,
+    QMenu,
+    QInputDialog,
+)
 from PyQt6.QtWebEngineCore import (
     QWebEngineProfile,
     QWebEnginePage,
@@ -38,7 +44,11 @@ from icon_assets import build_app_icon
 from windows_taskbar import TaskbarBadge
 from startup_manager import is_startup_enabled, set_startup_enabled
 from global_hotkey import GlobalHotkey, MOD_CONTROL, MOD_ALT, MOD_NOREPEAT
-from trusted_origins import is_trusted_host
+from trusted_origins import (
+    is_trusted_navigation_target,
+    is_trusted_permission_origin,
+    is_externally_openable,
+)
 
 # Matches Messenger's title prefix, e.g. "(3) Messenger"
 UNREAD_TITLE_RE = re.compile(r"^\((\d+)\)")
@@ -51,7 +61,9 @@ ENTRY_SCRIPT = Path(__file__).resolve()
 
 # Permission types we're willing to auto-grant, and only ever to a
 # trusted (Messenger/Facebook) origin — needed for calls, screen
-# share, and native-looking notifications.
+# share, and native-looking notifications. Desktop capture also
+# requires completing the desktopMediaRequested picker flow below;
+# granting the permission alone doesn't let a source be selected.
 GRANTABLE_PERMISSIONS = {
     QWebEnginePermission.PermissionType.MediaAudioCapture,
     QWebEnginePermission.PermissionType.MediaVideoCapture,
@@ -67,14 +79,16 @@ class MessengerPage(QWebEnginePage):
     Facebook-family origins stay inside the app; anything else (a
     clicked link, a redirect, a compromised/injected page) is sent to
     the system browser instead of loading inside this Messenger-branded
-    native window."""
+    native window — and only if it's a scheme worth handing to the OS
+    at all (see trusted_origins.is_externally_openable)."""
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
         if not is_main_frame:
             return True  # don't gate subresources/iframes (CDN assets etc.)
-        if is_trusted_host(url.host()):
+        if is_trusted_navigation_target(url.scheme(), url.host()):
             return True
-        QDesktopServices.openUrl(url)
+        if is_externally_openable(url.scheme()):
+            QDesktopServices.openUrl(url)
         return False
 
 
@@ -155,7 +169,11 @@ class MessengerView(QWebEngineView):
                 lambda: QGuiApplication.clipboard().setText(link_url.toString())
             )
             open_link_action = menu.addAction("Open Link in Browser")
-            open_link_action.triggered.connect(lambda: QDesktopServices.openUrl(link_url))
+            open_link_action.triggered.connect(
+                lambda: QDesktopServices.openUrl(link_url)
+                if is_externally_openable(link_url.scheme())
+                else None
+            )
 
         media_url = request.mediaUrl()
         if not media_url.isEmpty():
@@ -190,6 +208,7 @@ class MessengerWindow(QMainWindow):
         self.app_icon = build_app_icon()
         self.setWindowIcon(self.app_icon)
         self.taskbar_badge = None  # created after the native window exists
+        self._current_notification = None  # kept alive so .click() works
 
         # Persistent profile so login/session survives restarts.
         profile = QWebEngineProfile("messenger-standalone", self)
@@ -214,13 +233,16 @@ class MessengerWindow(QMainWindow):
 
         # Native notification path — no injected JS/WebChannel bridge.
         # Qt hands us a QWebEngineNotification with title/message/origin
-        # already parsed; we just re-show it via the tray icon.
+        # already parsed; we retain it, .show() it, and forward a click
+        # back into the page via .click() so Messenger's own
+        # notification-click handling actually runs.
         profile.setNotificationPresenter(self._present_notification)
 
         self.view = MessengerView(self)
         self.page = MessengerPage(profile, self.view)
         self.page.permissionRequested.connect(self._handle_permission_requested)
         self.page.newWindowRequested.connect(self._handle_new_window_request)
+        self.page.desktopMediaRequested.connect(self._handle_desktop_media_requested)
         self.view.setPage(self.page)
 
         self.setCentralWidget(self.view)
@@ -231,34 +253,78 @@ class MessengerWindow(QMainWindow):
         self._setup_global_hotkey()
 
     def _handle_permission_requested(self, permission):
-        origin_host = permission.origin().host()
-        if is_trusted_host(origin_host) and permission.permissionType() in GRANTABLE_PERMISSIONS:
+        origin = permission.origin()
+        trusted = is_trusted_permission_origin(origin.scheme(), origin.host(), origin.port())
+        if trusted and permission.permissionType() in GRANTABLE_PERMISSIONS:
             permission.grant()
         else:
             permission.deny()
+
+    def _handle_desktop_media_requested(self, request):
+        # Reached only after DesktopVideoCapture/DesktopAudioVideoCapture
+        # was already granted to a trusted origin above; this step just
+        # lets the user pick *which* screen/window to share — without
+        # it, Messenger's getDisplayMedia() call would hang forever
+        # with no source ever selected.
+        screens_model = request.screensModel()
+        windows_model = request.windowsModel()
+
+        options = []
+        for row in range(screens_model.rowCount()):
+            label = screens_model.index(row, 0).data(Qt.ItemDataRole.DisplayRole)
+            options.append((f"Screen: {label}", "screen", row))
+        for row in range(windows_model.rowCount()):
+            label = windows_model.index(row, 0).data(Qt.ItemDataRole.DisplayRole)
+            options.append((f"Window: {label}", "window", row))
+
+        if not options:
+            request.cancel()
+            return
+
+        labels = [label for label, _, _ in options]
+        choice, ok = QInputDialog.getItem(
+            self, "Share your screen", "Choose what to share with Messenger:", labels, 0, False
+        )
+        if not ok:
+            request.cancel()
+            return
+
+        _, kind, row = options[labels.index(choice)]
+        if kind == "screen":
+            request.selectScreen(screens_model.index(row, 0))
+        else:
+            request.selectWindow(windows_model.index(row, 0))
 
     def _handle_new_window_request(self, request):
         # Messenger uses target="_blank" for some links (e.g. external
         # sites shared in chat). Qt does nothing with these unless
         # handled: trusted destinations open in this same window,
-        # everything else goes to the system browser rather than
-        # silently failing or popping an unmanaged child window.
+        # externally-openable ones go to the system browser, anything
+        # else is dropped rather than silently failing or handing an
+        # arbitrary scheme to the OS.
         url = request.requestedUrl()
-        if is_trusted_host(url.host()):
+        if is_trusted_navigation_target(url.scheme(), url.host()):
             request.openIn(self.page)
-        else:
+        elif is_externally_openable(url.scheme()):
             QDesktopServices.openUrl(url)
 
     def _present_notification(self, notification):
-        origin_host = notification.origin().host()
-        if not is_trusted_host(origin_host):
+        origin = notification.origin()
+        if not is_trusted_permission_origin(origin.scheme(), origin.host(), origin.port()):
             return  # ignore notifications from any non-Messenger origin
+
+        self._current_notification = notification
+        notification.show()
         self.tray.showMessage(
             notification.title() or "Messenger",
             notification.message(),
             QSystemTrayIcon.MessageIcon.Information,
             5000,
         )
+
+    def _on_tray_message_clicked(self):
+        if self._current_notification is not None:
+            self._current_notification.click()
 
     def _setup_global_hotkey(self):
         # Ctrl+Alt+M to show/hide from anywhere. Change the modifiers/
@@ -305,6 +371,7 @@ class MessengerWindow(QMainWindow):
 
         self.tray.setContextMenu(self.tray_menu)
         self.tray.activated.connect(self._on_tray_activated)
+        self.tray.messageClicked.connect(self._on_tray_message_clicked)
         self.tray.show()
 
     def _on_tray_activated(self, reason):
