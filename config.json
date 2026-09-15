@@ -1,0 +1,37 @@
+{
+  "_README": "User-tunable knobs for the Messenger appliance. Missing/invalid fields fall back to built-in defaults (see app_config.py) — the app still starts. Security-perimeter settings (which HOSTS may hold permissions, which URL schemes are allowed) live in trusted_origins.py on purpose, not here. With dev_mode on, the console logs every externalised navigation and dropped popup, so you can see what to tune.",
+
+  "dev_mode": true,
+
+  "navigation": {
+    "_note": "facebook.com PATH prefixes that stay in-app (segment-boundary matched: /login matches /login and /login/... but NOT /login.evil or /helpful). Everything else on facebook.com opens in your real browser; the bare / feed is bounced to /messages. If a login step gets kicked out to the browser, watch the [nav] log and add the exact path to facebook_auth_prefixes.",
+    "facebook_messaging_prefixes": ["/messages", "/e2ee", "/t/"],
+    "facebook_auth_prefixes": [
+      "/login", "/checkpoint", "/recover", "/two_factor", "/2fa",
+      "/authentication", "/oauth", "/dialog", "/privacy", "/policies",
+      "/cookie", "/consent", "/settings"
+    ]
+  },
+
+  "telemetry_filter": {
+    "_note": "Drops Facebook background beacon/logging traffic to cut the resource drain. Ships DISABLED because it hasn't been verified against a live authenticated session — turn it on (enabled: true) only after you've confirmed login, messaging, attachments, and voice/video calls all still work. host \"\" matches any host; path is a plain prefix. Over-blocking breaks chat.",
+    "enabled": false,
+    "log_blocked": true,
+    "block_rules": [
+      { "host": "facebook.com", "path": "/ajax/bz" },
+      { "host": "facebook.com", "path": "/tr/" },
+      { "host": "facebook.com", "path": "/tr?" },
+      { "host": "facebook.com", "path": "/ajax/bnzai" },
+      { "host": "facebook.com", "path": "/privacy_sandbox" }
+    ]
+  },
+
+  "chrome_filter": {
+    "_note": "CSS selectors hidden on the MESSAGES page only (each applied as 'selector { display: none !important }'), plus gesture-aware autoplay pausing (autoplay is paused; video you click to play is left alone). The injected script self-gates to facebook.com messaging paths, so login/checkpoint/settings are never touched. Prefer stable role/aria selectors; use dev_mode Inspect Element to find more.",
+    "hide_selectors": [
+      "[role=\"banner\"]",
+      "[aria-label=\"Facebook\"][role=\"navigation\"]"
+    ],
+    "pause_autoplay": true
+  }
+}

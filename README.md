@@ -2,10 +2,21 @@
 
 A standalone desktop client for Facebook Messenger, built to replace
 the official app Facebook discontinued. It's a native window wrapped
-around the real `messenger.com` web app (via PyQt6 + QtWebEngine),
-not a reverse-engineered API client — so it stays in sync with
-whatever Facebook changes on their end, with no ToS-risky login
-spoofing.
+around the real Messenger web app (via PyQt6 + QtWebEngine), not a
+reverse-engineered API client — so it stays in sync with whatever
+Facebook changes on their end, with no ToS-risky login spoofing.
+
+**Message-only by design.** Meta is retiring the standalone
+`messenger.com` web product (~April 2026): after login, desktop web
+messaging is served from `facebook.com/messages`. That means the chat
+now lives *on* facebook.com, right next to the feed, Watch, Reels and
+Marketplace. This app deliberately fences itself onto the messaging
+surface: `/messages` and the login/auth flows load in-app, the bare
+`facebook.com/` feed is bounced straight to `/messages` so you never
+see it, and everything else on facebook.com (a shared post, a profile,
+a video, Marketplace) — plus every off-site link — opens in your real
+browser instead of hijacking this window. See **Message-only
+isolation** below.
 
 ## Features
 
@@ -74,7 +85,11 @@ found during review (see Changelog).
 | `windows_taskbar.py` | Windows taskbar overlay badge (`ITaskbarList3` via `comtypes`) |
 | `startup_manager.py` | Launch-at-startup toggle (`HKCU\...\Run` registry key) |
 | `global_hotkey.py` | System-wide show/hide hotkey (`RegisterHotKey` via `ctypes`) |
-| `trusted_origins.py` | Navigation vs. permission trust policies, shared across the app |
+| `config.json` | Single user-tunable config: facebook path allowlists, telemetry rules, chrome selectors |
+| `app_config.py` | Fail-safe loader for `config.json` (falls back to built-in defaults) |
+| `trusted_origins.py` | Navigation (4-way, path-aware), new-window, and permission trust policies, shared across the app |
+| `request_filter.py` | Network-level telemetry/beacon blocker (`QWebEngineUrlRequestInterceptor`) |
+| `chrome_filter.py` | Injected CSS/JS: hides residual Facebook chrome, pauses autoplay video |
 | `tests/test_pure_logic.py` | Unit tests for the above pure-logic pieces |
 
 ## Security notes
@@ -83,33 +98,52 @@ This app embeds a full browser engine pointed at an authenticated
 site, so the trust boundary matters — and it's deliberately **two
 different policies**, not one:
 
-- **Navigation policy** (`is_trusted_navigation_target`): which hosts
-  are allowed to load as top-level content — just `messenger.com` and
-  `facebook.com` (and their subdomains), over HTTPS only.
-  `fbcdn.net`/`fbsbx.com` are deliberately *not* included: they're
-  only ever needed as subresources (images, media), which
-  `acceptNavigationRequest()` already allows unconditionally via its
-  `is_main_frame` check, so they never needed a place in the
-  top-level allowlist. `MessengerPage.acceptNavigationRequest()`
-  enforces this; anything else opens externally (if it's a scheme
-  worth handing to the OS at all — see below) instead of loading
-  inside this Messenger-branded window. `target="_blank"` popups
-  follow the same rule.
-- **Permission policy** (`is_trusted_permission_origin`) — narrower
-  still and origin-aware, not just hostname-based: only a real HTTPS
-  `messenger.com`/`facebook.com` origin on the default port can be
-  granted microphone, camera, screen-share, or notification access.
-  `http://messenger.com` or `https://messenger.com:4443` are rejected
-  too — matching the scheme and port, not just the host name, is what
-  makes this origin-safe rather than hostname-only.
+- **Navigation policy** (`classify_navigation`): a top-level URL is
+  sorted into one of four actions rather than a yes/no host check —
+  `IN_APP`, `REWRITE_TO_MESSAGES`, `EXTERNAL`, or `DROP`.
+  `messenger.com` (and subdomains) stay in-app wholesale over HTTPS on
+  the default port. `facebook.com` is a **mixed host**: only the
+  messaging paths (`/messages`, `/e2ee`, `/t/`) and the auth paths
+  (`/login`, `/checkpoint`, `/oauth`, …) stay in-app; bare `facebook.com/`
+  (the feed) is rewritten to the messages surface; any other facebook.com
+  path opens externally. Path matching is **segment-boundary** for both
+  messaging and auth, so `/login` matches `/login` and `/login/…` but not
+  `/login.evil`, `/helpful`, or `/settings-malicious`. The classifier is
+  also **port-aware**: a non-default HTTPS port (`…:4443/messages`) is
+  never IN_APP, matching the permission policy so there's one definition
+  of "trusted origin". `fbcdn.net`/`fbsbx.com` are still never in the
+  top-level allowlist — they're subresources, which
+  `acceptNavigationRequest()` allows unconditionally via its
+  `is_main_frame` check. `target="_blank"` popups go through
+  `classify_new_window`, which adds two guards: an internal-scheme,
+  empty-host popup (a `window.open()` `about:blank`) is **dropped**
+  (can't blank the chat), and launching the **external** system browser
+  additionally requires `request.isUserInitiated()` — a real user
+  gesture — so a script can't auto-pop your browser to arbitrary sites.
+  The facebook.com path allowlists live in `config.json`; with `dev_mode`
+  on, every externalised navigation and dropped popup is logged to the
+  console so you can spot a login path that needs adding.
+- **Permission policy** (`is_trusted_permission_origin`) — the narrowest
+  boundary. An **explicit host allowlist** (exact match, no subdomain
+  wildcard: `messenger.com`, `www.messenger.com`, `facebook.com`,
+  `www.facebook.com`, `web.facebook.com`), HTTPS on the default port only.
+  `http://…` and `https://…:4443` are rejected. Navigation tolerates
+  facebook.com subdomains for login robustness, but capability grants
+  deliberately do **not**, so a rogue facebook.com subdomain that somehow
+  loaded in-app still can't obtain mic/camera/notifications. Because the
+  profile is persistent, the app sets
+  `PersistentPermissionsPolicy.AskEveryTime` so a stored grant (notably
+  Notifications, a persistent permission) can't outlive and bypass this
+  policy across restarts — the Python policy stays authoritative each
+  session.
 - **Microphone/camera get an extra native confirmation prompt**
-  beyond the origin check (`_confirm_media_permission`) — the origin
-  check alone would let any trusted-origin page turn the mic/camera
-  on with zero human decision point. The choice is cached for the
-  rest of the running session so it doesn't re-prompt on every call.
-  Screen share has an equivalent gate built in already (you have to
-  actively pick a source); notifications don't get one since they're
-  lower-stakes.
+  (`_confirm_media_permission`) beyond the origin check. The decision is
+  cached **per `(origin, capability)`** — approving the mic on one origin
+  does not silently approve the camera, or a different origin — and the
+  prompt names the actual host and the actual capability requested
+  (`www.facebook.com wants to use your microphone.`), not a fixed
+  "microphone and camera". Screen share has an equivalent gate already
+  (you actively pick a source); notifications don't get one (lower-stakes).
 - **Screen sharing** (`_handle_desktop_media_requested`): the
   screen/window list Qt provides is a live model that can change
   while the picker dialog is open. The picker uses
@@ -146,9 +180,10 @@ popups, permissions) picks it up automatically.
   Ctrl+Alt+M clashes with something else on your system.
 - **Spellcheck language**: set in `MessengerWindow.__init__` via
   `profile.setSpellCheckLanguages([...])` — defaults to `en-US`.
-- **Developer tools**: `MessengerView.DEV_MODE = True` keeps
-  "Inspect Element" in the right-click menu. Set to `False` before
-  producing a release build or handing this to a non-technical user.
+- **Developer tools**: `dev_mode` in `config.json` (default `true`) keeps
+  "Inspect Element" in the right-click menu and enables the `[nav]`/
+  `[popup]` console logging used to tune the allowlists. Set it to `false`
+  before handing this to a non-technical user.
 - **App icon**: currently a drawn placeholder (blue rounded square,
   "M" mark). Replace the body of `build_app_icon()` in
   `icon_assets.py` with a real designed icon whenever you have one.
@@ -195,7 +230,150 @@ someone else.
   `pip freeze > requirements-lock.txt` and install from that for
   anything beyond local dev, rather than relying on the floor alone.
 
+## Message-only isolation
+
+The whole app is scoped to the messaging surface. Three subsystems do
+this, and **all of them are tuned from a single file, `config.json`** —
+you shouldn't need to edit any `.py` to adjust behaviour. The loader
+(`app_config.py`) is fail-safe: a missing or malformed `config.json`, or
+any field of the wrong type, falls back to built-in defaults with a
+warning, so a config typo can't brick the app. Each section in
+`config.json` has an inline `_note`. What's deliberately **not** in the
+config — the trusted host list and allowed URL schemes — stays in
+`trusted_origins.py`, so a stray config edit can't widen the security
+perimeter.
+
+- **Navigation** (`config.json` → `navigation`) keeps you on the
+  facebook.com messaging + auth paths, rewrites the feed to `/messages`,
+  and externalises everything else. If a login/auth step ever gets kicked
+  out to the browser, the `dev_mode` console log prints the exact path
+  (`[nav] external … <url>`) — add it to `facebook_auth_prefixes`.
+- **Telemetry blocking** (`config.json` → `telemetry_filter`) drops
+  Facebook's background beacon/logging traffic to cut the "handbrake"
+  resource drain. It ships **disabled** (`"enabled": false`) — it's an
+  explicitly-unverified network mutation, so the safe posture is off until
+  you've confirmed login, messaging, attachments, and voice/video calls
+  all still work, then flip it on deliberately. `log_blocked` prints each
+  blocked request. Only widen `block_rules` for host/path pairs you've
+  watched in the log and trust as analytics-only — over-blocking breaks
+  chat.
+- **Chrome hiding** (`config.json` → `chrome_filter`) lists CSS selectors
+  hidden on the messages page (each applied as `display: none !important`)
+  and toggles autoplay pausing. The injected script **self-gates to the
+  messages surface** — it does nothing on login/checkpoint/settings pages,
+  so it can't hide a security notice or control. Autoplay handling is
+  **gesture-aware**: video that plays on its own is paused, but video you
+  click to play is left alone. Facebook's class names are obfuscated and
+  change often, so the seed selectors lean on stable `role`/`aria`
+  attributes and are meant to be extended: with `dev_mode` on, Inspect
+  Element on whatever you want gone and add a selector.
+
+## Video playback ("Sorry, we're having trouble playing this video")
+
+This is **not a bug in this app** — it's a QtWebEngine build limitation.
+Qt WebEngine only decodes MP4/H.264/AAC (what most Facebook video uses)
+when it's compiled with `-webengine-proprietary-codecs`, and the official
+Qt binaries the PyQt6 wheels are built from ship with those codecs **off**
+because H.264/AAC are patent-encumbered. There's no drop-in codec pack:
+Qt WebEngine links FFmpeg statically at build time, so the codecs must be
+present in the engine itself. WebM/VP8/VP9 play; H.264 doesn't.
+
+You can confirm it on your own machine — with `dev_mode` on (default;
+`config.json`), right-click → Inspect Element → Console, and run:
+
+```
+document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"')
+```
+
+`""` means H.264 is missing (that's the error); `"probably"`/`"maybe"`
+means it's present.
+
+Rather than chase a custom codec-enabled Qt build, this app leans into
+the message-only design: Facebook video lives under facebook.com content
+paths, which now open in your **real browser** (which has the codecs), and
+in-app autoplay is paused so the codec error doesn't fire on clips you
+weren't going to watch here anyway. If you genuinely need in-app H.264,
+the only real fix is a Qt WebEngine built with proprietary codecs (some
+Linux distros ship one; on Windows it means a custom build).
+
 ## Changelog
+
+**v0.6.1** — Fixes from a fourth adversarial review (privacy/trust boundary):
+- **Media consent is now origin + capability specific.** The old single
+  cached boolean meant approving the mic auto-approved the camera and every
+  other origin; the decision is now keyed to `(scheme, host, port,
+  permission_type)` and the prompt names the actual host and capability.
+- **Tightened the trust boundary.** Auth paths are matched on a segment
+  boundary now (so `/login.evil`, `/helpful`, `/settings-malicious` no
+  longer count as in-app); `/help` was dropped from the in-app set. The
+  **permission** boundary is now an explicit exact-host allowlist (no
+  subdomain wildcard), so a rogue facebook.com subdomain can't obtain
+  mic/camera/notifications even though navigation still tolerates
+  subdomains for login robustness.
+- **External popups require a user gesture.** `newWindowRequested` now
+  checks `isUserInitiated()` before launching the system browser, so a
+  script can't auto-pop your real browser; automatic in-app opens are
+  still allowed.
+- **Navigation is port-aware.** `classify_navigation`/`classify_new_window`
+  take the port and refuse a non-default HTTPS port for in-app, matching
+  the permission policy (one definition of "trusted origin").
+- **Persistent permissions can't outlive the policy.** The persistent
+  profile now sets `PersistentPermissionsPolicy.AskEveryTime`, so a stored
+  Notifications grant can't bypass the Python policy across restarts.
+- **Telemetry filter now ships disabled** (`"enabled": false`) — the safe
+  posture for an unverified network mutation until the messaging matrix is
+  exercised.
+- **Cosmetic injection is messages-only and gesture-aware.** The script
+  self-gates to facebook.com messaging paths (never touches login/
+  checkpoint/settings), and autoplay pausing no longer blocks
+  user-initiated playback.
+- **Implemented the navigation logging the README promised** — with
+  `dev_mode` on, every externalised navigation and dropped popup is logged;
+  `dev_mode` itself is now a `config.json` setting.
+- Tests: reviewer's loose-auth probes, port matrix, explicit-host
+  permission allowlist, media-key keying, injection gate, and config
+  fallbacks — all revert-proven. 53 tests total (plus Qt-guarded media
+  tests), all passing.
+
+Not changed, with rationale (see the review response): navigation still
+tolerates facebook.com subdomains (an explicit nav host list needs a live
+login trace to avoid breaking sign-in; the *permission* boundary is the
+one that was tightened); `acceptNavigationRequest` still externalises
+main-frame departures including redirects (blocking those breaks
+facebook.com link shims); `dev_mode` ships **on** because this is a
+personal build and the tuning workflow depends on it (flip it off in
+`config.json` before handing the app to anyone else); the dependency lock
+and the PyQt GPL/commercial licensing posture are distribution-time items,
+not code changes — a lock generated in CI here would pin the wrong
+(Linux) wheels for a Windows target.
+
+**v0.6** — Re-scoped to a message-only appliance after Meta began folding
+web messaging back into `facebook.com/messages` (messenger.com being
+retired ~April 2026):
+- Replaced the yes/no host trust check with a 4-way, path-aware
+  `classify_navigation` (`IN_APP` / `REWRITE_TO_MESSAGES` / `EXTERNAL` /
+  `DROP`). facebook.com is now a mixed host: only messaging + auth paths
+  stay in-app, the bare feed is bounced to `/messages`, all other
+  facebook.com content and every off-site link opens in the real browser
+- Fixed the `about:blank` new-window seam flagged in review: popups now go
+  through `classify_new_window`, which drops internal-scheme/empty-host
+  popups instead of routing them into (and blanking) the main page
+- Added a network telemetry/beacon blocker (`request_filter.py`) to cut
+  Facebook's background resource drain — conservative, logged, and fully
+  revertible
+- Added injected CSS/JS (`chrome_filter.py`) to hide residual Facebook
+  chrome and pause autoplay video
+- Documented the QtWebEngine H.264 codec limitation as the real cause of
+  the "trouble playing this video" error, with the message-only design
+  (video opens in the real browser) as the fix
+- Consolidated every user-tunable knob (facebook path allowlists,
+  telemetry block rules, chrome selectors + autoplay toggle) into a single
+  `config.json` with a fail-safe loader (`app_config.py`) that falls back
+  to built-in defaults on any missing/invalid field — no more editing
+  `.py` files to tune behaviour; the security perimeter stays in code
+- Tests: navigation-policy matrix, new-window about:blank regression, the
+  telemetry matcher, and the config loader (missing/malformed/bad-type
+  fallbacks), all revert-proven — 41 tests total, all passing
 
 **v0.5** — Fixes from a third adversarial review:
 - Fixed a release-blocking screen-share bug: the picker previously

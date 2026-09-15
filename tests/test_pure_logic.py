@@ -1,8 +1,7 @@
 """
-Unit tests for the pure-logic pieces of the app — the ones the review
-specifically called out as easy to cover and exactly where real bugs
-were found (startup command, trust policies, unread-title parsing).
-No Qt/WebEngine needed to run these.
+Unit tests for the pure-logic pieces of the app — the trust/navigation
+policy, the telemetry-filter matcher, the screen-share label rule, the
+startup command, and unread-title parsing. No Qt/WebEngine needed.
 
 Run with:
     python -m unittest discover -s tests
@@ -16,81 +15,190 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trusted_origins import (
-    is_trusted_navigation_target,
+    classify_navigation,
+    classify_new_window,
     is_trusted_permission_origin,
     is_externally_openable,
+    NAV_IN_APP,
+    NAV_REWRITE_TO_MESSAGES,
+    NAV_EXTERNAL,
+    NAV_DROP,
 )
+from request_filter import should_block
 
 # Mirrors messenger_app.UNREAD_TITLE_RE without importing the Qt-heavy module.
 UNREAD_TITLE_RE = re.compile(r"^\((\d+)\)")
 
 
-class TestNavigationTrust(unittest.TestCase):
-    def test_https_exact_matches_are_trusted(self):
-        for host in ("messenger.com", "facebook.com"):
-            self.assertTrue(is_trusted_navigation_target("https", host))
+class TestNavigationPolicy(unittest.TestCase):
+    def test_messenger_com_stays_in_app(self):
+        for host in ("messenger.com", "www.messenger.com"):
+            self.assertEqual(classify_navigation("https", host, "/"), NAV_IN_APP)
+            self.assertEqual(classify_navigation("https", host, "/t/123"), NAV_IN_APP)
 
-    def test_https_subdomains_are_trusted(self):
-        self.assertTrue(is_trusted_navigation_target("https", "www.messenger.com"))
-        self.assertTrue(is_trusted_navigation_target("https", "m.facebook.com"))
+    def test_facebook_messages_surface_stays_in_app(self):
+        # The whole point: the chat now lives on facebook.com/messages and
+        # must NOT be externalised.
+        for path in ("/messages", "/messages/", "/messages/t/999", "/e2ee/t/1"):
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", path), NAV_IN_APP
+            )
 
-    def test_cdn_hosts_are_not_trusted_as_top_level_navigation(self):
-        # fbcdn.net/fbsbx.com are fine as subresources (images, media)
-        # via acceptNavigationRequest's is_main_frame check, but must
-        # NOT be able to replace the whole window as a top-level page.
-        self.assertFalse(is_trusted_navigation_target("https", "scontent.fbcdn.net"))
-        self.assertFalse(is_trusted_navigation_target("https", "media.fbsbx.com"))
+    def test_facebook_messages_boundary_not_overmatched(self):
+        # "/messagesomething" is NOT the messages surface.
+        self.assertEqual(
+            classify_navigation("https", "www.facebook.com", "/messagesX"), NAV_EXTERNAL
+        )
 
-    def test_plain_http_is_not_trusted(self):
-        # Same host, wrong scheme — must not inherit trust.
-        self.assertFalse(is_trusted_navigation_target("http", "messenger.com"))
+    def test_facebook_auth_paths_stay_in_app(self):
+        # Login/checkpoint must stay in-app or sign-in breaks (an external
+        # browser wouldn't share this app's session cookies). Matched on a
+        # segment boundary now.
+        for path in ("/login", "/login/", "/checkpoint/?next=x",
+                     "/two_factor", "/recover/initiate", "/privacy/policy",
+                     "/oauth/authorize", "/dialog/oauth"):
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", path), NAV_IN_APP
+            )
 
-    def test_internal_schemes_with_empty_host_are_trusted(self):
-        self.assertTrue(is_trusted_navigation_target("about", ""))
-        self.assertTrue(is_trusted_navigation_target("qrc", ""))
+    def test_loose_auth_probes_are_now_external(self):
+        # Regression for the reviewer's finding: loose prefix matching used
+        # to let all of these through as IN_APP. Boundary matching rejects
+        # them. (/login.php-style real endpoints, if any, are added to
+        # config after the dev log shows them.)
+        for path in ("/login.evil", "/settings-malicious", "/privacy-invasive",
+                     "/helpful", "/oauth-malicious", "/login.php"):
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", path), NAV_EXTERNAL
+            )
 
-    def test_data_scheme_with_empty_host_is_not_trusted(self):
-        # data: content is not inherently trusted just because it has
-        # no host to check.
-        self.assertFalse(is_trusted_navigation_target("data", ""))
+    def test_help_path_now_opens_externally(self):
+        # /help was dropped from the in-app allowlist (not an auth flow).
+        self.assertEqual(
+            classify_navigation("https", "www.facebook.com", "/help"), NAV_EXTERNAL
+        )
 
-    def test_unrelated_domains_are_not_trusted(self):
-        self.assertFalse(is_trusted_navigation_target("https", "evil.com"))
+    def test_bare_facebook_feed_is_rewritten_to_messages(self):
+        self.assertEqual(
+            classify_navigation("https", "www.facebook.com", "/"),
+            NAV_REWRITE_TO_MESSAGES,
+        )
+        self.assertEqual(
+            classify_navigation("https", "www.facebook.com", ""),
+            NAV_REWRITE_TO_MESSAGES,
+        )
 
-    def test_lookalike_domains_are_not_trusted(self):
-        self.assertFalse(is_trusted_navigation_target("https", "notfacebook.com"))
-        self.assertFalse(is_trusted_navigation_target("https", "facebook.com.evil.net"))
+    def test_facebook_content_goes_external(self):
+        # Watch, Reels, a shared post, a profile, Marketplace, a video —
+        # all leave the app for the real browser.
+        for path in ("/watch", "/reel/123", "/marketplace/", "/groups/x",
+                     "/stories/1", "/some.person", "/photo/?fbid=1",
+                     "/permalink.php", "/videos/123"):
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", path), NAV_EXTERNAL
+            )
 
-    def test_case_insensitive(self):
-        self.assertTrue(is_trusted_navigation_target("https", "Messenger.COM"))
+    def test_offsite_links_go_external(self):
+        self.assertEqual(
+            classify_navigation("https", "example.com", "/article"), NAV_EXTERNAL
+        )
+
+    def test_plain_http_facebook_is_not_loaded_in_app(self):
+        # Wrong scheme must not inherit trust; http is OS-openable so it's
+        # handed out rather than loaded in-app.
+        self.assertEqual(
+            classify_navigation("http", "www.facebook.com", "/messages"), NAV_EXTERNAL
+        )
+
+    def test_lookalike_hosts_not_in_app(self):
+        for host in ("notfacebook.com", "facebook.com.evil.net", "evil.com"):
+            self.assertEqual(
+                classify_navigation("https", host, "/messages"), NAV_EXTERNAL
+            )
+
+    def test_internal_scheme_empty_host_allowed_as_top_level(self):
+        # about:blank as a real main-frame load is fine.
+        self.assertEqual(classify_navigation("about", "", "/"), NAV_IN_APP)
+        self.assertEqual(classify_navigation("qrc", "", ""), NAV_IN_APP)
+
+    def test_non_openable_scheme_empty_host_dropped(self):
+        self.assertEqual(classify_navigation("data", "", ""), NAV_DROP)
+        self.assertEqual(classify_navigation("javascript", "", ""), NAV_DROP)
+
+    def test_case_insensitive_host(self):
+        self.assertEqual(
+            classify_navigation("https", "WWW.Facebook.COM", "/messages"), NAV_IN_APP
+        )
+
+
+class TestNewWindowPolicy(unittest.TestCase):
+    def test_about_blank_popup_is_dropped_not_routed_to_main_page(self):
+        # Regression: reusing the nav policy let a window.open() about:blank
+        # popup load into the main page and blank out the chat. New-window
+        # policy must DROP internal-scheme popups.
+        self.assertEqual(classify_new_window("about", "", "/"), NAV_DROP)
+        self.assertEqual(classify_new_window("qrc", "", ""), NAV_DROP)
+
+    def test_new_window_otherwise_matches_navigation(self):
+        self.assertEqual(
+            classify_new_window("https", "www.facebook.com", "/messages"), NAV_IN_APP
+        )
+        self.assertEqual(
+            classify_new_window("https", "example.com", "/x"), NAV_EXTERNAL
+        )
+
+
+class TestNavigationPort(unittest.TestCase):
+    def test_default_ports_stay_in_app(self):
+        for port in (None, -1, 443):
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", "/messages", port),
+                NAV_IN_APP,
+            )
+
+    def test_non_default_ports_are_externalised(self):
+        # Regression for the reviewer's finding: navigation used to ignore
+        # the port, so :4443 was treated like ordinary 443.
+        for port in (4443, 8443, 8080):
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", "/messages", port),
+                NAV_EXTERNAL,
+            )
+
+    def test_new_window_also_honours_port(self):
+        self.assertEqual(
+            classify_new_window("https", "www.facebook.com", "/messages", 4443),
+            NAV_EXTERNAL,
+        )
 
 
 class TestPermissionTrust(unittest.TestCase):
-    def test_https_default_port_messenger_or_facebook_is_trusted(self):
-        self.assertTrue(is_trusted_permission_origin("https", "messenger.com", -1))
-        self.assertTrue(is_trusted_permission_origin("https", "www.facebook.com", -1))
+    def test_explicit_allowed_hosts_are_trusted(self):
+        for host in ("messenger.com", "www.messenger.com", "facebook.com",
+                     "www.facebook.com", "web.facebook.com"):
+            self.assertTrue(is_trusted_permission_origin("https", host, -1))
 
     def test_explicit_default_port_443_is_trusted(self):
-        self.assertTrue(is_trusted_permission_origin("https", "messenger.com", 443))
+        self.assertTrue(is_trusted_permission_origin("https", "www.facebook.com", 443))
 
     def test_non_default_port_is_not_trusted(self):
-        self.assertFalse(is_trusted_permission_origin("https", "messenger.com", 4443))
+        self.assertFalse(is_trusted_permission_origin("https", "www.facebook.com", 4443))
 
     def test_http_is_not_trusted(self):
-        self.assertFalse(is_trusted_permission_origin("http", "messenger.com", -1))
+        self.assertFalse(is_trusted_permission_origin("http", "www.facebook.com", -1))
 
     def test_empty_host_is_never_trusted_for_permissions(self):
-        # Unlike navigation, there is no internal-scheme exception here —
-        # permission grants must fail closed on an empty/ambiguous origin.
         self.assertFalse(is_trusted_permission_origin("about", "", -1))
         self.assertFalse(is_trusted_permission_origin("data", "", -1))
 
-    def test_cdn_hosts_are_not_trusted_for_permissions(self):
-        # fbcdn.net/fbsbx.com are fine as navigation targets but must
-        # NOT be able to request microphone/camera/screen-share/
-        # notification access just by being a valid content host.
-        self.assertFalse(is_trusted_permission_origin("https", "scontent.fbcdn.net", -1))
-        self.assertFalse(is_trusted_permission_origin("https", "media.fbsbx.com", -1))
+    def test_subdomain_wildcard_no_longer_applies_to_permissions(self):
+        # Regression for the reviewer's finding: permissions used a
+        # subdomain suffix match, so any *.facebook.com could hold a
+        # capability. Now it's an exact-host allowlist — an unlisted
+        # subdomain is denied even though navigation may tolerate it.
+        for host in ("foo.facebook.com", "m.facebook.com",
+                     "scontent.fbcdn.net", "media.fbsbx.com"):
+            self.assertFalse(is_trusted_permission_origin("https", host, -1))
 
 
 class TestExternallyOpenable(unittest.TestCase):
@@ -103,14 +211,189 @@ class TestExternallyOpenable(unittest.TestCase):
             self.assertFalse(is_externally_openable(scheme))
 
 
-class TestDesktopMediaLabelDisambiguation(unittest.TestCase):
-    """The screen-share picker folds a 1-based row number into each
-    option's label (e.g. "Window 1: Chrome", "Window 2: Chrome") so
-    that two sources sharing an identical title are still individually
-    selectable — labels.index(choice) would otherwise always resolve
-    to the first match. This tests just that string-building rule in
-    isolation, without needing a live Qt model."""
+class TestTelemetryMatcher(unittest.TestCase):
+    def test_blocks_configured_telemetry(self):
+        self.assertTrue(should_block("www.facebook.com", "/ajax/bz"))
+        self.assertTrue(should_block("facebook.com", "/tr/"))
+        self.assertTrue(should_block("web.facebook.com", "/tr?ev=1"))
 
+    def test_does_not_block_messaging_paths(self):
+        # Must never block the messaging surface or GraphQL API.
+        self.assertFalse(should_block("www.facebook.com", "/messages"))
+        self.assertFalse(should_block("www.facebook.com", "/api/graphql/"))
+        self.assertFalse(should_block("edge-chat.facebook.com", "/"))
+
+    def test_does_not_block_unrelated_hosts(self):
+        self.assertFalse(should_block("example.com", "/ajax/bz"))
+
+    def test_empty_host_rule_matches_any_host(self):
+        self.assertTrue(should_block("anything.test", "/x", rules=(("", "/x"),)))
+
+
+class TestConfigLoader(unittest.TestCase):
+    import tempfile
+
+    def _write(self, text):
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = Path(d) / "config.json"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_missing_file_falls_back_to_defaults(self):
+        import app_config
+        cfg = app_config.load_config(Path("/no/such/config.json"))
+        msg, auth = app_config.navigation_prefixes(cfg)
+        self.assertIn("/messages", msg)
+        self.assertIn("/login", auth)
+
+    def test_malformed_json_falls_back_to_defaults(self):
+        import app_config
+        p = self._write("{ this is not valid json ")
+        cfg = app_config.load_config(p)
+        enabled, log, rules = app_config.telemetry_settings(cfg)
+        self.assertFalse(enabled)          # default posture is off
+        self.assertTrue(len(rules) > 0)    # but the default rules are present
+
+    def test_note_keys_are_ignored(self):
+        import app_config
+        p = self._write('{"navigation": {"_note": "hi", '
+                        '"facebook_messaging_prefixes": ["/only"]}}')
+        cfg = app_config.load_config(p)
+        msg, auth = app_config.navigation_prefixes(cfg)
+        self.assertEqual(msg, ("/only",))
+        # untouched section keeps defaults
+        self.assertIn("/login", auth)
+
+    def test_bad_field_type_falls_back_per_field(self):
+        import app_config
+        p = self._write('{"chrome_filter": {"hide_selectors": "not-a-list", '
+                        '"pause_autoplay": false}}')
+        cfg = app_config.load_config(p)
+        selectors, pause = app_config.chrome_settings(cfg)
+        self.assertTrue(len(selectors) > 0)   # fell back to defaults
+        self.assertFalse(pause)               # valid bool honoured
+
+    def test_block_rules_normalised_to_tuples(self):
+        import app_config
+        p = self._write('{"telemetry_filter": {"block_rules": '
+                        '[{"host": "x.com", "path": "/y"}, {"nope": 1}]}}')
+        cfg = app_config.load_config(p)
+        _, _, rules = app_config.telemetry_settings(cfg)
+        self.assertIn(("x.com", "/y"), rules)
+        # the malformed rule (no path) is dropped
+        self.assertTrue(all(len(r) == 2 for r in rules))
+
+    def test_telemetry_ships_disabled_by_default(self):
+        import app_config
+        cfg = app_config.load_config(Path("/no/such/config.json"))
+        enabled, _, _ = app_config.telemetry_settings(cfg)
+        self.assertFalse(enabled)
+
+    def test_dev_mode_scalar_loads_and_falls_back(self):
+        import app_config
+        # explicit false honoured
+        p = self._write('{"dev_mode": false}')
+        self.assertFalse(app_config.dev_mode_enabled(app_config.load_config(p)))
+        # wrong type -> default (True)
+        p2 = self._write('{"dev_mode": "yes"}')
+        self.assertTrue(app_config.dev_mode_enabled(app_config.load_config(p2)))
+
+
+class TestCssFromSelectors(unittest.TestCase):
+    def test_builds_display_none_rules(self):
+        from chrome_filter import css_from_selectors
+        css = css_from_selectors(['[role="banner"]', ".x"])
+        self.assertIn('[role="banner"] { display: none !important; }', css)
+        self.assertIn('.x { display: none !important; }', css)
+
+    def test_empty_list_is_empty_css(self):
+        from chrome_filter import css_from_selectors
+        self.assertEqual(css_from_selectors([]), "")
+
+
+class TestChromeInjectionGate(unittest.TestCase):
+    def test_injection_self_gates_to_messages_surface(self):
+        from chrome_filter import build_injection_js, css_from_selectors
+        js = build_injection_js(css_from_selectors(['.x']), True,
+                                ("/messages", "/e2ee"))
+        # The script must bail unless on a messaging surface, so login/
+        # settings pages are never touched.
+        self.assertIn("onMessages()", js)
+        self.assertIn("if (!onMessages()) return;", js)
+        self.assertIn("facebook.com", js)
+
+    def test_autoplay_tamer_is_gesture_aware(self):
+        from chrome_filter import build_injection_js
+        js = build_injection_js("", True)
+        # Must track a user gesture and only pause when none is recent —
+        # i.e. it does NOT pause user-initiated playback.
+        self.assertIn("lastGesture", js)
+        self.assertIn("Date.now() - lastGesture", js)
+
+    def test_autoplay_tamer_omitted_when_disabled(self):
+        from chrome_filter import build_injection_js
+        self.assertNotIn("lastGesture", build_injection_js("", False))
+
+
+try:
+    import PyQt6  # noqa: F401
+    _HAVE_QT = True
+except Exception:
+    _HAVE_QT = False
+
+
+@unittest.skipUnless(_HAVE_QT, "PyQt6 not installed in this environment")
+class TestMediaConsentKeying(unittest.TestCase):
+    """Regression for the reviewer's HIGH finding: consent used one global
+    boolean, so approving the mic auto-approved the camera and other
+    origins. The key must distinguish origin AND capability."""
+
+    def test_key_distinguishes_capability_and_origin(self):
+        import messenger_app as m
+        from PyQt6.QtWebEngineCore import QWebEnginePermission as P
+        mic = P.PermissionType.MediaAudioCapture
+        cam = P.PermissionType.MediaVideoCapture
+        k_mic = m.media_permission_key("https", "www.facebook.com", -1, mic)
+        k_cam = m.media_permission_key("https", "www.facebook.com", -1, cam)
+        k_other = m.media_permission_key("https", "web.facebook.com", -1, mic)
+        self.assertNotEqual(k_mic, k_cam)     # mic approval != camera
+        self.assertNotEqual(k_mic, k_other)   # different origin distinct
+
+    def test_capability_label_names_the_actual_capability(self):
+        import messenger_app as m
+        from PyQt6.QtWebEngineCore import QWebEnginePermission as P
+        self.assertEqual(
+            m.media_capability_label(P.PermissionType.MediaAudioCapture), "microphone")
+        self.assertEqual(
+            m.media_capability_label(P.PermissionType.MediaVideoCapture), "camera")
+        self.assertEqual(
+            m.media_capability_label(P.PermissionType.MediaAudioVideoCapture),
+            "microphone and camera")
+
+
+class TestClassifyWithCustomPrefixes(unittest.TestCase):
+    def test_custom_messaging_prefix_is_honoured(self):
+        # A path that's external by default becomes in-app when configured.
+        self.assertEqual(
+            classify_navigation("https", "www.facebook.com", "/inbox",
+                                messaging_prefixes=("/inbox",),
+                                auth_prefixes=()),
+            NAV_IN_APP,
+        )
+
+    def test_removing_default_prefix_externalises_messages(self):
+        # If a config omitted /messages, it would no longer stay in-app —
+        # proves the prefixes actually drive the decision.
+        self.assertEqual(
+            classify_navigation("https", "www.facebook.com", "/messages",
+                                messaging_prefixes=("/somethingelse",),
+                                auth_prefixes=()),
+            NAV_EXTERNAL,
+        )
+
+
+class TestDesktopMediaLabelDisambiguation(unittest.TestCase):
     @staticmethod
     def build_labels(screen_titles, window_titles):
         labels = [f"Screen {i + 1}: {t}" for i, t in enumerate(screen_titles)]

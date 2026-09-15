@@ -38,6 +38,7 @@ from PyQt6.QtWebEngineCore import (
     QWebEnginePage,
     QWebEngineSettings,
     QWebEnginePermission,
+    QWebEngineScript,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
@@ -46,15 +47,37 @@ from windows_taskbar import TaskbarBadge
 from startup_manager import is_startup_enabled, set_startup_enabled
 from global_hotkey import GlobalHotkey, MOD_CONTROL, MOD_ALT, MOD_NOREPEAT
 from trusted_origins import (
-    is_trusted_navigation_target,
+    classify_navigation,
+    classify_new_window,
     is_trusted_permission_origin,
     is_externally_openable,
+    NAV_IN_APP,
+    NAV_REWRITE_TO_MESSAGES,
+    NAV_EXTERNAL,
+)
+from request_filter import TelemetryBlocker
+from chrome_filter import build_injection_js, css_from_selectors
+from app_config import (
+    load_config,
+    navigation_prefixes,
+    telemetry_settings,
+    chrome_settings,
+    dev_mode_enabled,
 )
 
 # Matches Messenger's title prefix, e.g. "(3) Messenger"
 UNREAD_TITLE_RE = re.compile(r"^\((\d+)\)")
 
-MESSENGER_URL = "https://messenger.com"
+# Entry point. messenger.com still serves the login page; once you're
+# authenticated Meta redirects desktop web messaging to
+# facebook.com/messages (messenger.com is being retired ~April 2026), and
+# the navigation policy in trusted_origins keeps you pinned to the
+# messages surface from there.
+MESSENGER_URL = "https://www.messenger.com/"
+
+# Where the feed (bare facebook.com/) gets bounced to, and the canonical
+# in-app messaging destination.
+FACEBOOK_MESSAGES_URL = "https://www.facebook.com/messages"
 
 # The actual entry point, used to build a correct startup command
 # regardless of which module happens to be executing.
@@ -82,21 +105,89 @@ MEDIA_CAPTURE_PERMISSIONS = {
     QWebEnginePermission.PermissionType.MediaAudioVideoCapture,
 }
 
+# Human-readable capability names so the consent prompt names what's
+# actually being requested, instead of always saying "microphone and
+# camera".
+_MEDIA_CAPABILITY_LABELS = {
+    QWebEnginePermission.PermissionType.MediaAudioCapture: "microphone",
+    QWebEnginePermission.PermissionType.MediaVideoCapture: "camera",
+    QWebEnginePermission.PermissionType.MediaAudioVideoCapture: "microphone and camera",
+}
+
+
+def media_capability_label(permission_type) -> str:
+    return _MEDIA_CAPABILITY_LABELS.get(permission_type, "microphone/camera")
+
+
+def media_permission_key(scheme, host, port, permission_type):
+    """Cache key for a media-consent decision. Keyed by full origin AND
+    capability, so approving the mic on one origin does NOT silently
+    approve the camera, or a different origin."""
+    return ((scheme or "").lower(), (host or "").lower(), port, permission_type)
+
 
 class MessengerPage(QWebEnginePage):
-    """Enforces a trust boundary on top-level navigation: Messenger and
-    Facebook top-level origins stay inside the app; anything else (a
-    clicked link, a redirect, a compromised/injected page) is sent to
-    the system browser instead of loading inside this Messenger-branded
-    native window — and only if it's a scheme worth handing to the OS
-    at all (see trusted_origins.is_externally_openable)."""
+    """Enforces a message-only trust boundary on top-level navigation.
+
+    The chat surface now lives at facebook.com/messages, right next to the
+    feed/Watch/Reels/Marketplace this app exists to avoid, so a yes/no host
+    check is no longer enough — trusted_origins.classify_navigation sorts
+    each main-frame URL into one of four actions:
+
+      IN_APP              stay in this window (messenger.com; the
+                          facebook.com messaging + auth paths)
+      REWRITE_TO_MESSAGES bare facebook.com/ (the feed) -> bounce to the
+                          messages surface so the feed never renders
+      EXTERNAL            hand to the system browser (other facebook.com
+                          content, off-site links, and — usefully — video,
+                          which plays there since this engine lacks the
+                          H.264 codecs)
+      DROP                ignore (unsafe scheme, hostile popup)
+    """
+
+    def __init__(self, profile, parent=None,
+                 messaging_prefixes=None, auth_prefixes=None, dev_mode=False):
+        super().__init__(profile, parent)
+        # facebook.com path allowlists, threaded in from config.json. None
+        # means "use trusted_origins' built-in defaults".
+        self._messaging_prefixes = messaging_prefixes
+        self._auth_prefixes = auth_prefixes
+        self._dev_mode = dev_mode
+
+    def _classify(self, url):
+        if self._messaging_prefixes is None or self._auth_prefixes is None:
+            return classify_navigation(
+                url.scheme(), url.host(), url.path(), url.port())
+        return classify_navigation(
+            url.scheme(), url.host(), url.path(), url.port(),
+            self._messaging_prefixes, self._auth_prefixes,
+        )
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
         if not is_main_frame:
             return True  # don't gate subresources/iframes (CDN assets etc.)
-        if is_trusted_navigation_target(url.scheme(), url.host()):
+
+        action = self._classify(url)
+
+        if action != NAV_IN_APP and self._dev_mode:
+            # The navigation-logging the README promises. With dev_mode on,
+            # every URL that DOESN'T stay in-app is printed with the action
+            # taken — this is how you spot a login/auth path that got
+            # wrongly externalised and needs adding to config.json.
+            print(f"[nav] {action:20} {nav_type} {url.toString()}")
+
+        if action == NAV_IN_APP:
             return True
-        if is_externally_openable(url.scheme()):
+
+        if action == NAV_REWRITE_TO_MESSAGES:
+            # Defer the reload: mutating the page from inside
+            # acceptNavigationRequest is reentrant. singleShot(0) runs it
+            # after this call returns. The messages URL re-enters here and
+            # classifies as IN_APP, so there's no loop.
+            QTimer.singleShot(0, lambda: self.setUrl(QUrl(FACEBOOK_MESSAGES_URL)))
+            return False
+
+        if action == NAV_EXTERNAL and is_externally_openable(url.scheme()):
             QDesktopServices.openUrl(url)
         return False
 
@@ -106,9 +197,10 @@ class MessengerView(QWebEngineView):
     instead of Chromium's full default (which includes irrelevant items
     like View Page Source, Save As, and Print)."""
 
-    # Keeps "Inspect Element" available for debugging. Set False before
-    # handing this off to a non-technical user.
-    DEV_MODE = True
+    # Runtime value is set from config.json (dev_mode) in MessengerWindow;
+    # this class default is the safe fallback if the view is ever
+    # constructed without the window wiring it up.
+    DEV_MODE = False
 
     def contextMenuEvent(self, event):
         request = self.lastContextMenuRequest()
@@ -218,11 +310,31 @@ class MessengerWindow(QMainWindow):
         self.setWindowIcon(self.app_icon)
         self.taskbar_badge = None  # created after the native window exists
         self._current_notification = None  # kept alive so .click()/.close() work
-        self._session_media_permission_choice = None  # cached Yes/No for this run
+        # Media consent cache, keyed by (scheme, host, port, permission_type)
+        # so one approval can't leak across origins or capabilities.
+        self._media_permission_cache = {}
+
+        # Single source of user-tunable behaviour (config.json). Fail-safe:
+        # a missing/broken config falls back to built-in defaults.
+        self.config = load_config()
+        self._messaging_prefixes, self._auth_prefixes = navigation_prefixes(self.config)
+        self._dev_mode = dev_mode_enabled(self.config)
+        # DEV_MODE governs the right-click "Inspect Element" item too.
+        MessengerView.DEV_MODE = self._dev_mode
 
         # Persistent profile so login/session survives restarts.
         profile = QWebEngineProfile("messenger-standalone", self)
         self.profile = profile  # keep a strong reference alongside the page's
+
+        # A named (persistent) profile defaults to storing granted
+        # permissions on disk — notably Notifications, which is a persistent
+        # permission — so an accepted decision could outlive and bypass our
+        # own permissionRequested policy across restarts. This app's Python
+        # policy is meant to be authoritative, so force every permission
+        # back through it each session.
+        profile.setPersistentPermissionsPolicy(
+            QWebEngineProfile.PersistentPermissionsPolicy.AskEveryTime
+        )
 
         # No hardcoded UA override: an outdated frozen UA string is
         # more likely to trigger unsupported-browser warnings than
@@ -241,6 +353,38 @@ class MessengerWindow(QMainWindow):
         # Adjust to match your locale/keyboard if needed, e.g. "en-GB".
         profile.setSpellCheckLanguages(["en-US"])
 
+        # Network-level filter: drop Facebook's telemetry/beacon traffic to
+        # cut the background resource drain. Settings come from config.json
+        # (telemetry_filter). Conservative and logged by default — set
+        # "enabled": false there if messaging ever misbehaves.
+        if TelemetryBlocker is not None:
+            enabled, log_blocked, block_rules = telemetry_settings(self.config)
+            self._interceptor = TelemetryBlocker(
+                rules=block_rules, enabled=enabled, log_blocked=log_blocked,
+                parent=self,
+            )
+            profile.setUrlRequestInterceptor(self._interceptor)
+
+        # Cosmetic filter: hide residual Facebook chrome on the messages
+        # page and pause feed-style autoplay video (also stops the codec
+        # error firing on H.264 clips this engine can't play). Selectors +
+        # the autoplay toggle come from config.json (chrome_filter). Runs at
+        # document-ready in the page's own world.
+        hide_selectors, pause_autoplay = chrome_settings(self.config)
+        chrome_script = QWebEngineScript()
+        chrome_script.setName("chrome_filter")
+        chrome_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        chrome_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        chrome_script.setRunsOnSubFrames(False)
+        chrome_script.setSourceCode(
+            build_injection_js(
+                css_from_selectors(hide_selectors),
+                pause_autoplay,
+                self._messaging_prefixes,
+            )
+        )
+        profile.scripts().insert(chrome_script)
+
         # Native notification path — no injected JS/WebChannel bridge.
         # Qt hands us a QWebEngineNotification with title/message/origin
         # already parsed; we retain it, .show() it, and forward a click
@@ -249,7 +393,12 @@ class MessengerWindow(QMainWindow):
         profile.setNotificationPresenter(self._present_notification)
 
         self.view = MessengerView(self)
-        self.page = MessengerPage(profile, self.view)
+        self.page = MessengerPage(
+            profile, self.view,
+            messaging_prefixes=self._messaging_prefixes,
+            auth_prefixes=self._auth_prefixes,
+            dev_mode=self._dev_mode,
+        )
         self.page.permissionRequested.connect(self._handle_permission_requested)
         self.page.newWindowRequested.connect(self._handle_new_window_request)
         self.page.desktopMediaRequested.connect(self._handle_desktop_media_requested)
@@ -271,29 +420,35 @@ class MessengerWindow(QMainWindow):
             permission.deny()
             return
 
-        if permission_type in MEDIA_CAPTURE_PERMISSIONS and not self._confirm_media_permission():
+        if permission_type in MEDIA_CAPTURE_PERMISSIONS and \
+                not self._confirm_media_permission(origin, permission_type):
             permission.deny()
             return
 
         permission.grant()
 
-    def _confirm_media_permission(self) -> bool:
-        """A native Allow/Deny prompt for microphone/camera, on top of
-        the origin check — the origin check alone would let any
-        trusted-origin page turn the mic/camera on with no human
-        decision point at all. Cached for the rest of this run so it
-        doesn't re-prompt on every call."""
-        if self._session_media_permission_choice is not None:
-            return self._session_media_permission_choice
+    def _confirm_media_permission(self, origin, permission_type) -> bool:
+        """Native Allow/Deny prompt for microphone/camera, on top of the
+        origin check. The decision is cached per (origin, capability), NOT
+        globally — approving the mic on www.facebook.com does not silently
+        approve the camera, or the mic on a different origin. The prompt
+        names the actual origin and the actual capability requested."""
+        key = media_permission_key(
+            origin.scheme(), origin.host(), origin.port(), permission_type)
+        if key in self._media_permission_cache:
+            return self._media_permission_cache[key]
 
+        capability = media_capability_label(permission_type)
+        host = origin.host() or "This site"
         reply = QMessageBox.question(
             self,
             "Messenger",
-            "Messenger wants to use your microphone and camera.\n\nAllow?",
+            f"{host} wants to use your {capability}.\n\nAllow?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        self._session_media_permission_choice = reply == QMessageBox.StandardButton.Yes
-        return self._session_media_permission_choice
+        allowed = reply == QMessageBox.StandardButton.Yes
+        self._media_permission_cache[key] = allowed
+        return allowed
 
     def _handle_desktop_media_requested(self, request):
         # Reached only after DesktopVideoCapture/DesktopAudioVideoCapture
@@ -350,17 +505,38 @@ class MessengerWindow(QMainWindow):
             request.selectWindow(index)
 
     def _handle_new_window_request(self, request):
-        # Messenger uses target="_blank" for some links (e.g. external
-        # sites shared in chat). Qt does nothing with these unless
-        # handled: trusted destinations open in this same window,
-        # externally-openable ones go to the system browser, anything
-        # else is dropped rather than silently failing or handing an
-        # arbitrary scheme to the OS.
+        # Messenger/Facebook use target="_blank" for some links (external
+        # sites shared in chat, media viewers). Qt does nothing with these
+        # unless handled. classify_new_window applies the same message-only
+        # policy as top-level navigation, with one extra guard: an
+        # internal-scheme popup (e.g. window.open()'s about:blank) is
+        # DROPPED, never routed into the main page — otherwise a stray
+        # about:blank popup would blank out the live chat view.
         url = request.requestedUrl()
-        if is_trusted_navigation_target(url.scheme(), url.host()):
+        action = classify_new_window(
+            url.scheme(), url.host(), url.path(), url.port(),
+            self._messaging_prefixes, self._auth_prefixes,
+        )
+
+        # A page can script-open a popup with no user action at all. We let
+        # an automatic popup navigate IN-APP (a benign same-surface open),
+        # but launching the *external* system browser must require a real
+        # user gesture — otherwise a hostile/needy page could auto-pop your
+        # real browser to arbitrary sites. Qt exposes isUserInitiated()
+        # precisely for this distinction; don't rely on Chromium having
+        # already filtered it.
+        user_initiated = request.isUserInitiated()
+
+        if action == NAV_IN_APP:
             request.openIn(self.page)
-        elif is_externally_openable(url.scheme()):
+        elif action == NAV_REWRITE_TO_MESSAGES:
+            QTimer.singleShot(0, lambda: self.page.setUrl(QUrl(FACEBOOK_MESSAGES_URL)))
+        elif action == NAV_EXTERNAL and user_initiated and is_externally_openable(url.scheme()):
             QDesktopServices.openUrl(url)
+        elif self._dev_mode:
+            reason = "no user gesture" if action == NAV_EXTERNAL and not user_initiated else action
+            print(f"[popup] dropped ({reason}) {url.toString()}")
+        # anything else: dropped
 
     def _present_notification(self, notification):
         origin = notification.origin()
