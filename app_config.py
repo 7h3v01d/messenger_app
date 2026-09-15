@@ -259,8 +259,12 @@ def hotkey_settings(cfg: dict):
         names = d["modifiers"]
 
     key = h.get("key", d["key"])
-    if not (isinstance(key, str) and len(key) == 1 and key.isalnum()):
-        _warn("hotkey.key must be a single letter or digit; using default")
+    if not (isinstance(key, str) and len(key) == 1 and key.isascii() and key.isalnum()):
+        # Must be an ASCII A-Z/0-9 char: those map directly to Win32
+        # virtual-key codes via ord(key.upper()). A non-ASCII char like
+        # "ß" (upper() -> "SS") or a full-width "Ａ" would mis-register or
+        # crash RegisterHotKey, so fall back to the default.
+        _warn("hotkey.key must be a single ASCII letter or digit; using default")
         key = d["key"]
 
     mods = 0

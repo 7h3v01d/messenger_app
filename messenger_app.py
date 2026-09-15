@@ -220,6 +220,10 @@ class MessengerPage(QWebEnginePage):
             # the browser.
             ms_since = None if self._last_user_nav_ms is None else (now_ms - self._last_user_nav_ms)
             if external_launch_allowed(is_user_nav, ms_since):
+                # Consume the authorisation: one user gesture externalises
+                # one redirect chain, not every redirect for the next few
+                # seconds. A fresh user action is needed for the next launch.
+                self._last_user_nav_ms = None
                 QDesktopServices.openUrl(url)
             elif self._dev_mode:
                 print(f"[nav] external-suppressed (no user intent) {url.toString()}")

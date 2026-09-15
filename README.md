@@ -131,10 +131,10 @@ different policies**, not one:
   boundary. An **explicit host allowlist** (exact match, no subdomain
   wildcard: `messenger.com`, `www.messenger.com`, `facebook.com`,
   `www.facebook.com`, `web.facebook.com`), HTTPS on the default port only.
-  `http://…` and `https://…:4443` are rejected. Navigation tolerates
-  facebook.com subdomains for login robustness, but capability grants
-  deliberately do **not**, so a rogue facebook.com subdomain that somehow
-  loaded in-app still can't obtain mic/camera/notifications. Because the
+  `http://…` and `https://…:4443` are rejected. Both navigation and
+  capability grants use explicit exact-host allowlists (no subdomain
+  wildcard), so a rogue facebook.com subdomain is neither loaded in-app
+  nor able to obtain mic/camera/notifications. Because the
   profile is persistent, the app sets
   `PersistentPermissionsPolicy.AskEveryTime` so a stored grant (notably
   Notifications, a persistent permission) can't outlive and bypass this
@@ -305,6 +305,22 @@ the only real fix is a Qt WebEngine built with proprietary codecs (some
 Linux distros ship one; on Windows it means a custom build).
 
 ## Changelog
+
+**v0.6.4** — Post-freeze cleanup: the three tiny items from the PASS review,
+and nothing else (deliberately no new hardening/features).
+- **External-launch intent token is one-shot.** A successful external
+  browser launch now clears `_last_user_nav_ms`, so one user gesture
+  authorises exactly one redirect chain rather than every redirect for the
+  next few seconds.
+- **Hotkey key must be ASCII A–Z/0–9.** A non-ASCII single char (e.g. `ß`,
+  whose `.upper()` is `"SS"`) used to slip past validation and crash
+  `ord()` in `RegisterHotKey`; it now falls back to the default like any
+  other malformed key.
+- **README correction:** the permission-policy note no longer claims
+  navigation "tolerates facebook.com subdomains" — since v0.6.2 both
+  navigation and capability boundaries use explicit exact-host allowlists.
+- Tests: 73 total (added non-ASCII hotkey fallback + ASCII digit accept);
+  one-shot token behaviour verified via the offscreen build.
 
 **v0.6.3** — Startup-console cleanup and quality-of-life config:
 - **Spellcheck is now graceful.** It's enabled only when matching `.bdic`

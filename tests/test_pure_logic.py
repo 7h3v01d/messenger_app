@@ -535,6 +535,20 @@ class TestHotkeyConfig(unittest.TestCase):
         _, _, key = app_config.hotkey_settings(self._cfg(key="Ctrl"))  # not 1 char
         self.assertEqual(key, "M")
 
+    def test_non_ascii_key_falls_back(self):
+        # Regression: "ß".upper() == "SS" (len 2) would crash ord() in
+        # global_hotkey; full-width/other-script single chars map to VK
+        # codes this implementation doesn't support. All must fall back.
+        import app_config
+        for bad in ("ß", "٣", "Ａ", "İ"):
+            _, _, key = app_config.hotkey_settings(self._cfg(key=bad))
+            self.assertEqual(key, "M", f"{bad!r} should have fallen back")
+
+    def test_ascii_digit_key_is_accepted(self):
+        import app_config
+        _, _, key = app_config.hotkey_settings(self._cfg(key="7"))
+        self.assertEqual(key, "7")
+
     def test_disabled(self):
         import app_config
         enabled, _, _ = app_config.hotkey_settings(self._cfg(enabled=False))
