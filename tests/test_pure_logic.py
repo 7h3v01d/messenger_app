@@ -479,6 +479,68 @@ class TestPrefixValidation(unittest.TestCase):
         self.assertNotIn("/", auth)
 
 
+class TestSpellcheckConfig(unittest.TestCase):
+    def test_available_languages_detects_bdic(self):
+        import tempfile, app_config
+        d = tempfile.mkdtemp()
+        (Path(d) / "en-US-3-0.bdic").write_text("x")
+        avail = app_config.available_spellcheck_languages(
+            ["en-US", "fr-FR"], [d, "/nonexistent"])
+        self.assertEqual(avail, ["en-US"])   # fr-FR has no .bdic
+
+    def test_no_dictionaries_means_empty(self):
+        import app_config
+        self.assertEqual(
+            app_config.available_spellcheck_languages(["en-US"], ["/nope"]), [])
+
+    def test_settings_defaults_and_bad_path(self):
+        import app_config
+        cfg = app_config.load_config(Path("/no/such/config.json"))
+        langs, path = app_config.spellcheck_settings(cfg)
+        self.assertIn("en-US", langs)
+        self.assertIsNone(path)
+
+
+class TestHotkeyConfig(unittest.TestCase):
+    def _cfg(self, **hk):
+        return {"hotkey": hk}
+
+    def test_default_is_ctrl_alt_m_with_norepeat(self):
+        import app_config
+        enabled, mask, key = app_config.hotkey_settings(app_config.DEFAULTS)
+        self.assertTrue(enabled)
+        self.assertEqual(key, "M")
+        self.assertEqual(mask, 0x4000 | 0x0002 | 0x0001)  # NOREPEAT|CTRL|ALT
+
+    def test_custom_modifiers_and_key(self):
+        import app_config
+        _, mask, key = app_config.hotkey_settings(
+            self._cfg(modifiers=["shift", "win"], key="k"))
+        self.assertEqual(key, "K")
+        self.assertEqual(mask, 0x4000 | 0x0004 | 0x0008)  # NOREPEAT|SHIFT|WIN
+
+    def test_unknown_modifier_is_skipped(self):
+        import app_config
+        _, mask, _ = app_config.hotkey_settings(
+            self._cfg(modifiers=["ctrl", "bogus"], key="M"))
+        self.assertEqual(mask, 0x4000 | 0x0002)  # NOREPEAT|CTRL only
+
+    def test_empty_modifiers_fall_back_to_ctrl_alt(self):
+        import app_config
+        _, mask, _ = app_config.hotkey_settings(self._cfg(modifiers=[], key="M"))
+        self.assertEqual(mask, 0x4000 | 0x0002 | 0x0001)
+
+    def test_bad_key_falls_back_to_default(self):
+        import app_config
+        _, _, key = app_config.hotkey_settings(self._cfg(key="Ctrl"))  # not 1 char
+        self.assertEqual(key, "M")
+
+    def test_disabled(self):
+        import app_config
+        enabled, _, _ = app_config.hotkey_settings(self._cfg(enabled=False))
+        self.assertFalse(enabled)
+
+
 class TestDesktopMediaLabelDisambiguation(unittest.TestCase):
     @staticmethod
     def build_labels(screen_titles, window_titles):

@@ -54,6 +54,21 @@ DEFAULTS = {
         ],
         "pause_autoplay": True,
     },
+    "spellcheck": {
+        # Enabled only if matching .bdic dictionaries are actually present
+        # (the PyQt6 wheels don't ship them), so it's either working or
+        # silent — never noisy-and-broken.
+        "languages": ["en-US"],
+        "dictionaries_path": None,
+    },
+    "hotkey": {
+        # Global show/hide combo. Change these if the default clashes with
+        # another app (the symptom is a "could not register global hotkey"
+        # warning at startup). modifiers: any of ctrl/alt/shift/win.
+        "enabled": True,
+        "modifiers": ["ctrl", "alt"],
+        "key": "M",
+    },
 }
 
 
@@ -184,3 +199,79 @@ def chrome_settings(cfg: dict):
                              DEFAULTS["chrome_filter"]["hide_selectors"])
     pause = bool(c.get("pause_autoplay", True))
     return tuple(selectors), pause
+
+
+def spellcheck_settings(cfg: dict):
+    """(languages: tuple[str], dictionaries_path: str|None)."""
+    s = cfg.get("spellcheck", {})
+    langs = _as_str_list(s.get("languages"),
+                         DEFAULTS["spellcheck"]["languages"])
+    path = s.get("dictionaries_path")
+    if path is not None and not isinstance(path, str):
+        _warn("spellcheck.dictionaries_path must be a string or null; ignoring")
+        path = None
+    return tuple(langs), (path or None)
+
+
+def available_spellcheck_languages(languages, search_dirs):
+    """Return the subset of `languages` that have a matching `<lang>*.bdic`
+    dictionary in any of search_dirs. Used to enable spellcheck only when
+    it can actually work (Qt WebEngine needs the .bdic files, which the
+    PyQt6 wheels don't ship). Filesystem-based but easily testable with
+    temp dirs."""
+    found = []
+    dirs = [Path(d) for d in search_dirs if d]
+    for lang in languages:
+        for d in dirs:
+            try:
+                if d.is_dir() and any(d.glob(f"{lang}*.bdic")):
+                    found.append(lang)
+                    break
+            except OSError:
+                continue
+    return found
+
+
+# Modifier name -> Win32 bit. Mirrors the constants in global_hotkey.py;
+# duplicated here so this module stays Qt/Windows-free and unit-testable.
+_MODIFIER_BITS = {
+    "alt": 0x0001,
+    "ctrl": 0x0002, "control": 0x0002,
+    "shift": 0x0004,
+    "win": 0x0008, "super": 0x0008, "meta": 0x0008, "cmd": 0x0008,
+}
+_MOD_NOREPEAT = 0x4000
+_DEFAULT_MODS = _MODIFIER_BITS["ctrl"] | _MODIFIER_BITS["alt"]
+
+
+def hotkey_settings(cfg: dict):
+    """(enabled: bool, modifiers_mask: int, key: str) for the global
+    show/hide hotkey. Unknown modifiers are warned-and-skipped; an empty
+    or all-invalid modifier set falls back to Ctrl+Alt; a non-single-char
+    key falls back to the default. NOREPEAT is always OR'd in."""
+    h = cfg.get("hotkey", {})
+    d = DEFAULTS["hotkey"]
+    enabled = bool(h.get("enabled", d["enabled"]))
+
+    names = h.get("modifiers", d["modifiers"])
+    if not (isinstance(names, list) and all(isinstance(n, str) for n in names)):
+        _warn("hotkey.modifiers must be a list of strings; using default")
+        names = d["modifiers"]
+
+    key = h.get("key", d["key"])
+    if not (isinstance(key, str) and len(key) == 1 and key.isalnum()):
+        _warn("hotkey.key must be a single letter or digit; using default")
+        key = d["key"]
+
+    mods = 0
+    for n in names:
+        bit = _MODIFIER_BITS.get(n.strip().lower())
+        if bit:
+            mods |= bit
+        else:
+            _warn(f"hotkey: unknown modifier {n!r}, ignoring")
+    if mods == 0:
+        _warn("hotkey: no valid modifiers; using Ctrl+Alt")
+        mods = _DEFAULT_MODS
+
+    return enabled, mods | _MOD_NOREPEAT, key.upper()

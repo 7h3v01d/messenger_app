@@ -19,6 +19,7 @@ Run:
     python messenger_app.py
 """
 
+import os
 import re
 import sys
 import time
@@ -46,7 +47,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from icon_assets import build_app_icon
 from windows_taskbar import TaskbarBadge
 from startup_manager import is_startup_enabled, set_startup_enabled
-from global_hotkey import GlobalHotkey, MOD_CONTROL, MOD_ALT, MOD_NOREPEAT
+from global_hotkey import GlobalHotkey
 from trusted_origins import (
     classify_navigation,
     classify_new_window,
@@ -65,6 +66,9 @@ from app_config import (
     telemetry_settings,
     chrome_settings,
     dev_mode_enabled,
+    spellcheck_settings,
+    available_spellcheck_languages,
+    hotkey_settings,
 )
 
 # Matches Messenger's title prefix, e.g. "(3) Messenger"
@@ -379,9 +383,24 @@ class MessengerWindow(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ScreenCaptureEnabled, True)
 
-        profile.setSpellCheckEnabled(True)
-        # Adjust to match your locale/keyboard if needed, e.g. "en-GB".
-        profile.setSpellCheckLanguages(["en-US"])
+        # Spellcheck, but only if the Hunspell .bdic dictionaries are
+        # actually present — the PyQt6 wheels don't ship them, and enabling
+        # it without them just prints a "could not find dictionaries"
+        # warning and does nothing. Languages / an optional custom path come
+        # from config.json (spellcheck). Drop .bdic files into a
+        # qtwebengine_dictionaries folder (or point dictionaries_path at
+        # one) to turn it on. See the README.
+        langs, dict_path = spellcheck_settings(self.config)
+        available = available_spellcheck_languages(
+            langs, self._spellcheck_search_dirs(dict_path))
+        if available:
+            profile.setSpellCheckEnabled(True)
+            profile.setSpellCheckLanguages(list(available))
+        else:
+            profile.setSpellCheckEnabled(False)
+            if self._dev_mode and langs:
+                print(f"[spellcheck] no .bdic dictionaries found for "
+                      f"{list(langs)}; spellcheck off (see README to enable)")
 
         # Network-level filter: drop Facebook's telemetry/beacon traffic to
         # cut the background resource drain. Settings come from config.json
@@ -623,10 +642,38 @@ class MessengerWindow(QMainWindow):
             notification.click()
             self._close_current_notification()
 
+    @staticmethod
+    def _spellcheck_search_dirs(config_path):
+        """Directories Qt WebEngine will actually search for .bdic
+        dictionaries, in priority order: a config-supplied path, the
+        QTWEBENGINE_DICTIONARIES_PATH env var, the PyQt6 Qt6 bundle dir,
+        and a qtwebengine_dictionaries folder next to this script."""
+        dirs = []
+        if config_path:
+            dirs.append(config_path)
+        env = os.environ.get("QTWEBENGINE_DICTIONARIES_PATH")
+        if env:
+            dirs.append(env)
+        try:
+            import PyQt6
+            dirs.append(str(Path(PyQt6.__file__).parent / "Qt6"
+                            / "qtwebengine_dictionaries"))
+        except Exception:
+            pass
+        dirs.append(str(Path(__file__).resolve().parent
+                        / "qtwebengine_dictionaries"))
+        return dirs
+
     def _setup_global_hotkey(self):
-        # Ctrl+Alt+M to show/hide from anywhere. Change the modifiers/
-        # key here if it clashes with something else on your system.
-        self.hotkey = GlobalHotkey(modifiers=MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, key="M")
+        # Global show/hide combo, from config.json (hotkey). Default is
+        # Ctrl+Alt+M; change it there if it clashes with another app (the
+        # symptom is a "could not register global hotkey" warning). Set
+        # "enabled": false to skip the hotkey entirely.
+        enabled, modifiers, key = hotkey_settings(self.config)
+        if not enabled:
+            self.hotkey = None
+            return
+        self.hotkey = GlobalHotkey(modifiers=modifiers, key=key)
         self.hotkey.activated.connect(self._toggle_visibility)
         QApplication.instance().installNativeEventFilter(self.hotkey)
         QApplication.instance().aboutToQuit.connect(self.hotkey.unregister)
@@ -720,6 +767,18 @@ class MessengerWindow(QMainWindow):
 
 
 def main():
+    # If a custom spellcheck dictionaries path is configured, export it
+    # BEFORE QtWebEngine initialises — Qt reads QTWEBENGINE_DICTIONARIES_PATH
+    # at startup. (Dictionaries in the default Qt location are found without
+    # this.) Done here rather than in the window so it lands early enough.
+    try:
+        _cfg = load_config()
+        _, _dict_path = spellcheck_settings(_cfg)
+        if _dict_path and os.path.isdir(_dict_path):
+            os.environ.setdefault("QTWEBENGINE_DICTIONARIES_PATH", _dict_path)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Messenger")

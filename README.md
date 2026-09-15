@@ -179,11 +179,14 @@ popups, permissions) picks it up automatically.
 
 ## Customization
 
-- **Hotkey**: change the modifiers/key in
-  `MessengerWindow._setup_global_hotkey()` in `messenger_app.py` if
-  Ctrl+Alt+M clashes with something else on your system.
-- **Spellcheck language**: set in `MessengerWindow.__init__` via
-  `profile.setSpellCheckLanguages([...])` — defaults to `en-US`.
+- **Hotkey**: set `hotkey` in `config.json` (`enabled`, `modifiers` of
+  ctrl/alt/shift/win, `key`) if Ctrl+Alt+M clashes with something else on
+  your system, or set `"enabled": false` to turn it off.
+- **Spellcheck**: `config.json` → `spellcheck`. It's off unless matching
+  `.bdic` dictionaries are present — drop a `qtwebengine_dictionaries`
+  folder (e.g. an `en-US-*.bdic` from a Chromium/Hunspell dictionary set)
+  next to `messenger_app.py`, or point `dictionaries_path` at one, then set
+  `languages` to match.
 - **Developer tools**: `dev_mode` in `config.json` (default `true`) keeps
   "Inspect Element" in the right-click menu and enables the `[nav]`/
   `[popup]` console logging used to tune the allowlists. Set it to `false`
@@ -302,6 +305,26 @@ the only real fix is a Qt WebEngine built with proprietary codecs (some
 Linux distros ship one; on Windows it means a custom build).
 
 ## Changelog
+
+**v0.6.3** — Startup-console cleanup and quality-of-life config:
+- **Spellcheck is now graceful.** It's enabled only when matching `.bdic`
+  dictionaries are actually found (the PyQt6 wheels don't ship them), so
+  the "could not find dictionaries / Spellchecking can not be enabled"
+  warning is gone — it's either working or silently off. `config.json` →
+  `spellcheck` sets the languages and an optional `dictionaries_path`; drop
+  a `qtwebengine_dictionaries` folder next to the app (or point at one) to
+  turn it on.
+- **The global hotkey is now configurable** via `config.json` → `hotkey`
+  (`enabled`, `modifiers` of ctrl/alt/shift/win, and `key`). If the default
+  Ctrl+Alt+M is already taken by another app (the "could not register
+  global hotkey" warning), change it here or disable it. Unknown modifiers
+  and malformed keys fall back safely.
+- The `Permissions-Policy: Unrecognized feature` and `unload is not
+  allowed` console lines are emitted by Facebook's own pages against Qt's
+  Chromium and are harmless — not changed.
+- Tests: dictionary detection, and hotkey parsing (defaults, custom
+  modifiers, unknown-modifier skip, bad-key fallback, disabled) — 71 tests
+  total, all passing.
 
 **v0.6.2** — Fixes from a fifth adversarial review; closes the three
 freeze-gate items, all on the "what is a trusted navigation" boundary:

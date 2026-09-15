@@ -33,5 +33,18 @@
       "[aria-label=\"Facebook\"][role=\"navigation\"]"
     ],
     "pause_autoplay": true
+  },
+
+  "spellcheck": {
+    "_note": "Spellcheck for text you type in the message box. It only turns on if matching .bdic dictionaries are found — the PyQt6 wheels don't ship them, so it's off (and silent) by default. To enable: download a Hunspell .bdic (e.g. en-US-*.bdic) into a 'qtwebengine_dictionaries' folder next to messenger_app.py, or set dictionaries_path to a folder containing them.",
+    "languages": ["en-US"],
+    "dictionaries_path": null
+  },
+
+  "hotkey": {
+    "_note": "Global show/hide hotkey (works even when the app isn't focused). If you see 'could not register global hotkey' at startup, another app owns this combo — change it here. modifiers: any of ctrl/alt/shift/win; key: a single letter or digit. Set enabled to false to turn the hotkey off entirely.",
+    "enabled": true,
+    "modifiers": ["ctrl", "alt"],
+    "key": "M"
   }
 }
