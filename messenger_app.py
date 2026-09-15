@@ -21,6 +21,7 @@ Run:
 
 import re
 import sys
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QUrl, Qt, QTimer, QPersistentModelIndex, QModelIndex
@@ -51,6 +52,7 @@ from trusted_origins import (
     classify_new_window,
     is_trusted_permission_origin,
     is_externally_openable,
+    external_launch_allowed,
     NAV_IN_APP,
     NAV_REWRITE_TO_MESSAGES,
     NAV_EXTERNAL,
@@ -126,6 +128,17 @@ def media_permission_key(scheme, host, port, permission_type):
     return ((scheme or "").lower(), (host or "").lower(), port, permission_type)
 
 
+# Navigation types that represent a fresh user action (vs. a page- or
+# server-driven one). Used to decide whether an EXTERNAL navigation may
+# launch the system browser — see external_launch_allowed.
+_USER_DRIVEN_NAV_TYPES = frozenset({
+    QWebEnginePage.NavigationType.NavigationTypeLinkClicked,
+    QWebEnginePage.NavigationType.NavigationTypeTyped,
+    QWebEnginePage.NavigationType.NavigationTypeFormSubmitted,
+    QWebEnginePage.NavigationType.NavigationTypeBackForward,
+})
+
+
 class MessengerPage(QWebEnginePage):
     """Enforces a message-only trust boundary on top-level navigation.
 
@@ -153,6 +166,9 @@ class MessengerPage(QWebEnginePage):
         self._messaging_prefixes = messaging_prefixes
         self._auth_prefixes = auth_prefixes
         self._dev_mode = dev_mode
+        # Monotonic ms timestamp of the last user-driven main-frame
+        # navigation, used to authorise a following external launch.
+        self._last_user_nav_ms = None
 
     def _classify(self, url):
         if self._messaging_prefixes is None or self._auth_prefixes is None:
@@ -167,13 +183,18 @@ class MessengerPage(QWebEnginePage):
         if not is_main_frame:
             return True  # don't gate subresources/iframes (CDN assets etc.)
 
+        is_user_nav = nav_type in _USER_DRIVEN_NAV_TYPES
+        now_ms = time.monotonic() * 1000.0
+        if is_user_nav:
+            self._last_user_nav_ms = now_ms
+
         action = self._classify(url)
 
         if action != NAV_IN_APP and self._dev_mode:
             # The navigation-logging the README promises. With dev_mode on,
             # every URL that DOESN'T stay in-app is printed with the action
-            # taken — this is how you spot a login/auth path that got
-            # wrongly externalised and needs adding to config.json.
+            # taken — this is how you spot a login/auth path or host that
+            # got wrongly externalised and needs adding to config/allowlist.
             print(f"[nav] {action:20} {nav_type} {url.toString()}")
 
         if action == NAV_IN_APP:
@@ -188,7 +209,16 @@ class MessengerPage(QWebEnginePage):
             return False
 
         if action == NAV_EXTERNAL and is_externally_openable(url.scheme()):
-            QDesktopServices.openUrl(url)
+            # Only launch the system browser if this navigation carries
+            # user intent: it's itself a user action, or it's the redirect
+            # tail of a link the user clicked moments ago. A spontaneous
+            # page-driven redirect to an external site does NOT auto-launch
+            # the browser.
+            ms_since = None if self._last_user_nav_ms is None else (now_ms - self._last_user_nav_ms)
+            if external_launch_allowed(is_user_nav, ms_since):
+                QDesktopServices.openUrl(url)
+            elif self._dev_mode:
+                print(f"[nav] external-suppressed (no user intent) {url.toString()}")
         return False
 
 

@@ -15,6 +15,7 @@ Design rules:
 
 import copy
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -107,6 +108,36 @@ def _as_str_list(value, fallback):
     return list(fallback)
 
 
+# A path prefix must be absolute and have at least one character after the
+# leading slash, using only characters legal in a URL path. This rejects
+# the dangerous entries "", "/", " ", and non-absolute strings — any of
+# which would match every path and collapse the message-only boundary back
+# into a full Facebook browser.
+_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$")
+
+
+def _valid_prefixes(value, fallback, field_name):
+    """Coerce a config prefix list to str, drop any entry that fails the
+    safety format (with a loud warning), and fall back to defaults if
+    nothing valid remains. Also flags entries not in the shipped defaults
+    so custom overrides are visible."""
+    raw = _as_str_list(value, fallback)
+    valid = []
+    for entry in raw:
+        if _PREFIX_RE.match(entry):
+            valid.append(entry)
+            if entry not in fallback:
+                _warn(f"{field_name}: using custom prefix {entry!r} "
+                      f"(not in shipped defaults)")
+        else:
+            _warn(f"{field_name}: rejecting unsafe prefix {entry!r} — a "
+                  f"prefix must be absolute and non-empty (not \"\" or \"/\")")
+    if not valid:
+        _warn(f"{field_name}: no valid prefixes; using defaults")
+        return list(fallback)
+    return valid
+
+
 def dev_mode_enabled(cfg: dict) -> bool:
     """Whether developer features are on: right-click Inspect Element, plus
     console logging of externalised navigations and dropped popups (the
@@ -115,13 +146,17 @@ def dev_mode_enabled(cfg: dict) -> bool:
 
 
 def navigation_prefixes(cfg: dict):
-    """(messaging_prefixes, auth_prefixes) as tuples of str."""
+    """(messaging_prefixes, auth_prefixes) as tuples of str, each validated
+    so a dangerous entry (\"\", \"/\", non-absolute) can't widen the trust
+    boundary."""
     nav = cfg.get("navigation", {})
     d = DEFAULTS["navigation"]
-    msg = _as_str_list(nav.get("facebook_messaging_prefixes"),
-                       d["facebook_messaging_prefixes"])
-    auth = _as_str_list(nav.get("facebook_auth_prefixes"),
-                        d["facebook_auth_prefixes"])
+    msg = _valid_prefixes(nav.get("facebook_messaging_prefixes"),
+                          d["facebook_messaging_prefixes"],
+                          "facebook_messaging_prefixes")
+    auth = _valid_prefixes(nav.get("facebook_auth_prefixes"),
+                           d["facebook_auth_prefixes"],
+                           "facebook_auth_prefixes")
     return tuple(msg), tuple(auth)
 
 

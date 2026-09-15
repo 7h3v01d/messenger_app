@@ -100,29 +100,33 @@ different policies**, not one:
 
 - **Navigation policy** (`classify_navigation`): a top-level URL is
   sorted into one of four actions rather than a yes/no host check —
-  `IN_APP`, `REWRITE_TO_MESSAGES`, `EXTERNAL`, or `DROP`.
-  `messenger.com` (and subdomains) stay in-app wholesale over HTTPS on
-  the default port. `facebook.com` is a **mixed host**: only the
-  messaging paths (`/messages`, `/e2ee`, `/t/`) and the auth paths
-  (`/login`, `/checkpoint`, `/oauth`, …) stay in-app; bare `facebook.com/`
-  (the feed) is rewritten to the messages surface; any other facebook.com
-  path opens externally. Path matching is **segment-boundary** for both
-  messaging and auth, so `/login` matches `/login` and `/login/…` but not
-  `/login.evil`, `/helpful`, or `/settings-malicious`. The classifier is
-  also **port-aware**: a non-default HTTPS port (`…:4443/messages`) is
-  never IN_APP, matching the permission policy so there's one definition
-  of "trusted origin". `fbcdn.net`/`fbsbx.com` are still never in the
-  top-level allowlist — they're subresources, which
-  `acceptNavigationRequest()` allows unconditionally via its
-  `is_main_frame` check. `target="_blank"` popups go through
-  `classify_new_window`, which adds two guards: an internal-scheme,
-  empty-host popup (a `window.open()` `about:blank`) is **dropped**
-  (can't blank the chat), and launching the **external** system browser
-  additionally requires `request.isUserInitiated()` — a real user
-  gesture — so a script can't auto-pop your browser to arbitrary sites.
-  The facebook.com path allowlists live in `config.json`; with `dev_mode`
-  on, every externalised navigation and dropped popup is logged to the
-  console so you can spot a login path that needs adding.
+  `IN_APP`, `REWRITE_TO_MESSAGES`, `EXTERNAL`, or `DROP`. Hosts are an
+  **explicit exact-host allowlist** (no subdomain wildcard):
+  `messenger.com`/`www.messenger.com` are all-messaging and stay in-app;
+  `facebook.com`/`www.facebook.com`/`web.facebook.com` are **mixed** —
+  only the messaging paths (`/messages`, `/e2ee`, `/t/`) and auth paths
+  (`/login`, `/checkpoint`, `/oauth`, …) stay in-app, the bare
+  `facebook.com/` feed is rewritten to `/messages`, any other path opens
+  externally. An unlisted subdomain (`evil.facebook.com`) is externalised,
+  not trusted. Path matching is **segment-boundary** (so `/login` ≠
+  `/login.evil`), and the configured prefixes are **validated** at load
+  (`""`, `/`, non-absolute entries are rejected) so a config typo can't
+  collapse the boundary — with a defence-in-depth check in the matcher
+  too. The classifier is **port-aware** (`…:4443` is never IN_APP).
+  `fbcdn.net`/`fbsbx.com` are subresources, allowed unconditionally via
+  the `is_main_frame` check, never in the top-level allowlist.
+- **External launch requires user intent.** Both popups and main-frame
+  navigations only hand a URL to the system browser when the navigation
+  carries a real user action: a `target="_blank"` popup checks
+  `request.isUserInitiated()`, and a main-frame `EXTERNAL` navigation is
+  launched only if it's itself user-driven (`LinkClicked`/`Typed`/
+  `FormSubmitted`) or the redirect tail of a link clicked within the last
+  few seconds (`external_launch_allowed`). A spontaneous page-driven
+  redirect to an external site is suppressed, so a page can't auto-pop
+  your browser — while facebook.com link shims (click → 302) still work.
+  A `window.open()` `about:blank` popup is still dropped (can't blank the
+  chat). With `dev_mode` on, every externalised or suppressed navigation
+  is logged.
 - **Permission policy** (`is_trusted_permission_origin`) — the narrowest
   boundary. An **explicit host allowlist** (exact match, no subdomain
   wildcard: `messenger.com`, `www.messenger.com`, `facebook.com`,
@@ -202,8 +206,9 @@ or Finder's "Compress" after first clearing extended attributes with
 `__MACOSX/` tree of AppleDouble resource-fork files (`._*.py`) that
 are pure metadata but will make naive tools (e.g. `compileall`) choke
 on them even though every real project file compiles fine. Also set
-`MessengerView.DEV_MODE = False` before packaging a build meant for
-someone else.
+`"dev_mode": false` in `config.json` before packaging a build meant for
+someone else (the class default is already `False`; config is what
+turns it on).
 
 ## Known limitations
 
@@ -297,6 +302,34 @@ the only real fix is a Qt WebEngine built with proprietary codecs (some
 Linux distros ship one; on Windows it means a custom build).
 
 ## Changelog
+
+**v0.6.2** — Fixes from a fifth adversarial review; closes the three
+freeze-gate items, all on the "what is a trusted navigation" boundary:
+- **Navigation hosts are now an explicit exact-host allowlist**, replacing
+  subdomain suffix matching. `evil.facebook.com` / `attacker.messenger.com`
+  no longer inherit in-app trust; add an exact host (found via the
+  `dev_mode` `[nav]` log) only when a real login trace needs it.
+- **External browser launch now requires user intent**, for main-frame
+  navigations as well as popups. A user-driven navigation, or a redirect
+  within a few seconds of one (a link shim), externalises; a spontaneous
+  page-driven redirect is suppressed and logged. `external_launch_allowed`
+  encodes the rule and is unit-tested.
+- **Configured path prefixes are validated** at load: `""`, `/`,
+  non-absolute, and malformed entries are rejected with a loud warning and
+  fall back to defaults, and custom prefixes are flagged — so a config
+  typo can't silently turn the appliance back into a full Facebook
+  browser. A defence-in-depth check in the path matcher ignores `""`/`/`
+  even if passed directly.
+- Fixed the second README DEV_MODE reference the reviewer caught; `dev_mode`
+  is fully config-driven now.
+- Tests: exact-host regressions, the intent-launch matrix, prefix
+  validation, and the matcher-hardening guard — all revert-proven. 62
+  tests (plus Qt-guarded media tests), all passing.
+
+Still deliberate (personal-build / distribution, not code): `dev_mode`
+ships on for the tuning workflow (flip off in `config.json` before sharing
+the app); the dependency lock should be generated on the Windows target;
+the PyQt GPL/commercial licensing posture is a distribution-time decision.
 
 **v0.6.1** — Fixes from a fourth adversarial review (privacy/trust boundary):
 - **Media consent is now origin + capability specific.** The old single

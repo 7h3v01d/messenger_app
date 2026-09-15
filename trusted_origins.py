@@ -28,10 +28,10 @@ That forces THREE deliberately different policies:
   facebook.com paths go external.
 
 - Permission policy (is_trusted_permission_origin): which origins may be
-  granted microphone/camera/screen-share/notification access. The
-  narrowest boundary — an EXPLICIT host allowlist (exact match, no
-  subdomain wildcard), https + default port only. Navigation tolerates
-  facebook.com subdomains for login robustness; capability grants do not.
+  granted microphone/camera/screen-share/notification access. An EXPLICIT
+  host allowlist (exact match, no subdomain wildcard), https + default
+  port only. Navigation uses its own exact-host allowlists too (see
+  below); this one is the tightest — it also gates the capability grants.
 
 - External-scheme policy (is_externally_openable): which schemes are
   reasonable to hand to the OS at all.
@@ -47,26 +47,33 @@ NAV_EXTERNAL = "external"
 NAV_DROP = "drop"
 
 # --- Host policy -------------------------------------------------------
+#
+# Navigation now uses EXPLICIT exact-host allowlists, not subdomain suffix
+# matching. A compromised or abandoned Meta subdomain must not inherit the
+# app's "this is Messenger" trust just because it ends in facebook.com.
+# If a real login trace later shows another host is genuinely needed, add
+# that exact host here (the dev_mode [nav] log prints the host that got
+# externalised, so you can see what to add).
 
-# All-messaging host: every messenger.com surface (login + chat) may stay
-# in the app.
-MESSAGING_HOST_SUFFIXES = (
+# messenger.com hosts are all-messaging (login + chat) -> IN_APP wholesale.
+NAVIGATION_MESSENGER_HOSTS = frozenset({
     "messenger.com",
-)
+    "www.messenger.com",
+})
 
-# Mixed host: the chat surface now lives at facebook.com/messages, but so
-# does everything this app avoids. NOT trusted wholesale — only specific
-# path prefixes (below) stay in-app.
-MIXED_HOST_SUFFIXES = (
+# facebook.com hosts are MIXED: the chat surface lives here alongside the
+# feed/Watch/etc, so only the messaging/auth PATHS (below) stay in-app.
+NAVIGATION_FACEBOOK_HOSTS = frozenset({
     "facebook.com",
-)
+    "www.facebook.com",
+    "web.facebook.com",
+})
 
 # Permission grants (mic/camera/screen-share/notifications) are the sharp
-# end of the trust boundary, so — unlike navigation, which tolerates
-# subdomains for login robustness — these are gated to an EXPLICIT host
-# allowlist, exact match only. A rogue facebook.com subdomain that somehow
-# loaded in-app therefore still cannot obtain a capability grant. Add a
-# host here only when a real login/call trace proves it's needed.
+# end of the trust boundary — an EXPLICIT host allowlist, exact match. A
+# rogue facebook.com subdomain that somehow loaded in-app still cannot
+# obtain a capability grant. Add a host here only when a real login/call
+# trace proves it's needed.
 PERMISSION_ALLOWED_HOSTS = frozenset({
     "messenger.com",
     "www.messenger.com",
@@ -132,11 +139,6 @@ FACEBOOK_AUTH_PREFIXES = (
 )
 
 
-def _host_matches(host, suffixes) -> bool:
-    host = (host or "").lower()
-    return any(host == suffix or host.endswith("." + suffix) for suffix in suffixes)
-
-
 def _normalise_path(path) -> str:
     p = path or "/"
     if not p.startswith("/"):
@@ -146,9 +148,18 @@ def _normalise_path(path) -> str:
 
 def _path_has_prefix_boundary(path, prefixes) -> bool:
     """Prefix match on a path SEGMENT boundary: '/messages' matches
-    '/messages' and '/messages/t/1' but not '/messagesX'."""
+    '/messages' and '/messages/t/1' but not '/messagesX'.
+
+    Defence in depth: a prefix of "" or "/" is IGNORED, never matched.
+    Those would make every path match (turning the appliance back into a
+    full Facebook browser); app_config already rejects them at load time,
+    and this second check means even a prefix passed directly to the
+    classifier can't collapse the boundary.
+    """
     p = _normalise_path(path)
     for pre in prefixes:
+        if pre in ("", "/"):
+            continue
         if pre.endswith("/"):
             if p == pre.rstrip("/") or p.startswith(pre):
                 return True
@@ -194,16 +205,16 @@ def classify_navigation(scheme: str, host: str, path: str, port=None,
         # Never load plain http or an exotic scheme as top-level content.
         return NAV_EXTERNAL if scheme in EXTERNALLY_OPENABLE_SCHEMES else NAV_DROP
 
-    if not _is_default_https_port(port):
+    if _is_default_https_port(port) is False:
         # https on a non-default port (e.g. :4443) is never an in-app
         # origin — matching the permission policy so there's one
         # definition of "trusted origin". Hand it to the browser.
         return NAV_EXTERNAL
 
-    if _host_matches(host, MESSAGING_HOST_SUFFIXES):
-        return NAV_IN_APP  # messenger.com is all-messaging
+    if host in NAVIGATION_MESSENGER_HOSTS:
+        return NAV_IN_APP  # messenger.com hosts are all-messaging
 
-    if _host_matches(host, MIXED_HOST_SUFFIXES):
+    if host in NAVIGATION_FACEBOOK_HOSTS:
         if _path_has_prefix_boundary(path, messaging_prefixes):
             return NAV_IN_APP
         if _path_has_prefix_boundary(path, auth_prefixes):
@@ -216,7 +227,9 @@ def classify_navigation(scheme: str, host: str, path: str, port=None,
         # profile, Marketplace, a video -> real browser.
         return NAV_EXTERNAL
 
-    # Some other https host (a link someone sent in chat) -> real browser.
+    # Any other host — including an unlisted facebook.com/messenger.com
+    # subdomain — is not trusted for in-app navigation. Hand it to the
+    # browser (dev_mode logs the host so you can add it if login needs it).
     return NAV_EXTERNAL
 
 
@@ -262,3 +275,34 @@ def is_externally_openable(scheme: str) -> bool:
     schemes so a hostile chat link can't turn this app into an unprompted
     external-protocol launcher."""
     return (scheme or "").lower() in EXTERNALLY_OPENABLE_SCHEMES
+
+
+# How long a genuine user navigation "authorises" a following external
+# launch. A user clicks a link -> facebook.com issues a shim/302 redirect
+# to the real URL a moment later; that redirect should externalise. A
+# spontaneous page-driven redirect with no recent user action should not.
+EXTERNAL_LAUNCH_WINDOW_MS = 3000
+
+
+def external_launch_allowed(is_user_nav: bool, ms_since_user_nav,
+                            window_ms: int = EXTERNAL_LAUNCH_WINDOW_MS) -> bool:
+    """Decide whether an EXTERNAL-classified main-frame navigation may
+    launch the system browser.
+
+    Preserves user intent across a navigation chain rather than choosing
+    between "externalise every redirect" (a page can auto-launch your
+    browser) and "externalise nothing" (breaks facebook.com link shims):
+
+      - a navigation that is itself user-driven (a link click, form submit,
+        typed URL) -> allowed;
+      - a redirect / other page-driven navigation -> allowed ONLY if a
+        user-driven navigation happened within window_ms (i.e. it's the
+        tail of a link the user just clicked).
+
+    ms_since_user_nav is None when no user navigation has happened yet.
+    """
+    if is_user_nav:
+        return True
+    if ms_since_user_nav is None:
+        return False
+    return ms_since_user_nav <= window_ms

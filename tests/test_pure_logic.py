@@ -130,6 +130,37 @@ class TestNavigationPolicy(unittest.TestCase):
             classify_navigation("https", "WWW.Facebook.COM", "/messages"), NAV_IN_APP
         )
 
+    def test_arbitrary_subdomains_are_now_external(self):
+        # Regression for the reviewer's HIGH finding: navigation used a
+        # subdomain suffix match, so evil.facebook.com/messages and
+        # attacker.messenger.com/anything were IN_APP. Now navigation uses
+        # an exact-host allowlist — an unlisted subdomain is externalised.
+        self.assertEqual(
+            classify_navigation("https", "evil.facebook.com", "/messages"), NAV_EXTERNAL
+        )
+        self.assertEqual(
+            classify_navigation("https", "attacker.messenger.com", "/anything"), NAV_EXTERNAL
+        )
+        self.assertEqual(
+            classify_navigation("https", "m.facebook.com", "/messages"), NAV_EXTERNAL
+        )
+
+    def test_root_or_empty_prefix_cannot_collapse_boundary(self):
+        # Defence in depth for the config finding: even if a "/" or ""
+        # prefix reaches the classifier directly, it must not turn every
+        # path into IN_APP.
+        for bad in (("/",), ("",)):
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", "/marketplace",
+                                    None, bad, ()),
+                NAV_EXTERNAL,
+            )
+            self.assertEqual(
+                classify_navigation("https", "www.facebook.com", "/watch",
+                                    None, ("/messages",), bad),
+                NAV_EXTERNAL,
+            )
+
 
 class TestNewWindowPolicy(unittest.TestCase):
     def test_about_blank_popup_is_dropped_not_routed_to_main_page(self):
@@ -391,6 +422,61 @@ class TestClassifyWithCustomPrefixes(unittest.TestCase):
                                 auth_prefixes=()),
             NAV_EXTERNAL,
         )
+
+
+class TestExternalLaunchIntent(unittest.TestCase):
+    def test_user_driven_nav_may_launch(self):
+        from trusted_origins import external_launch_allowed
+        self.assertTrue(external_launch_allowed(True, None))
+        self.assertTrue(external_launch_allowed(True, 999999))
+
+    def test_recent_user_action_authorises_a_redirect(self):
+        from trusted_origins import external_launch_allowed
+        # redirect (not user-driven) 500ms after a user nav -> allowed
+        self.assertTrue(external_launch_allowed(False, 500, window_ms=3000))
+
+    def test_spontaneous_redirect_is_suppressed(self):
+        from trusted_origins import external_launch_allowed
+        # no user nav yet, or one long ago -> not allowed
+        self.assertFalse(external_launch_allowed(False, None))
+        self.assertFalse(external_launch_allowed(False, 10000, window_ms=3000))
+
+
+class TestPrefixValidation(unittest.TestCase):
+    def _cfg(self, messaging=None, auth=None):
+        cfg = {"navigation": {}}
+        if messaging is not None:
+            cfg["navigation"]["facebook_messaging_prefixes"] = messaging
+        if auth is not None:
+            cfg["navigation"]["facebook_auth_prefixes"] = auth
+        return cfg
+
+    def test_root_and_empty_prefixes_are_rejected_fall_back_to_defaults(self):
+        import app_config
+        msg, _ = app_config.navigation_prefixes(self._cfg(messaging=["/"]))
+        self.assertNotIn("/", msg)
+        self.assertIn("/messages", msg)          # fell back to defaults
+        msg2, _ = app_config.navigation_prefixes(self._cfg(messaging=[""]))
+        self.assertIn("/messages", msg2)
+
+    def test_non_absolute_and_whitespace_rejected(self):
+        import app_config
+        msg, _ = app_config.navigation_prefixes(
+            self._cfg(messaging=["messages", "  ", "/valid"]))
+        self.assertIn("/valid", msg)
+        self.assertNotIn("messages", msg)
+        self.assertNotIn("  ", msg)
+
+    def test_valid_custom_prefix_is_kept(self):
+        import app_config
+        msg, _ = app_config.navigation_prefixes(self._cfg(messaging=["/inbox"]))
+        self.assertEqual(msg, ("/inbox",))
+
+    def test_partial_invalid_list_keeps_valid_entries(self):
+        import app_config
+        _, auth = app_config.navigation_prefixes(self._cfg(auth=["/login", "/", ""]))
+        self.assertIn("/login", auth)
+        self.assertNotIn("/", auth)
 
 
 class TestDesktopMediaLabelDisambiguation(unittest.TestCase):
